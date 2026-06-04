@@ -429,6 +429,72 @@ def choose_intervals_for_day(hours_json, scheduled_for):
     return unknown if unknown else intervals
 
 
+
+def intervals_to_display(hours_json, scheduled_for):
+    intervals = choose_intervals_for_day(hours_json, scheduled_for)
+    if not intervals:
+        return ""
+    parts = []
+    for it in intervals:
+        o = it.get("opens_at")
+        c = it.get("closes_at")
+        if o and c:
+            parts.append(f"{o}-{c}")
+    seen = []
+    for p in parts:
+        if p not in seen:
+            seen.append(p)
+    return " / ".join(seen)
+
+
+def add_hours_display_columns(df):
+    df = df.copy()
+    if "hours_json" not in df.columns:
+        return df
+    df["horaires_ouverture"] = df.apply(
+        lambda r: "24/24 ou flexible" if r.get("type") == "Casier / Locker" else intervals_to_display(r.get("hours_json", "[]"), r.get("scheduled_for")),
+        axis=1,
+    )
+    df["pause_midi_detectee"] = df.get("has_lunch_break", False)
+    return df
+
+
+def estimate_max_route_duration_for_k(df, k, depot_lat, depot_lon):
+    df_sorted, groups = balance_groups_by_service(df, k, depot_lat, depot_lon)
+    groups = improve_balance(df_sorted, groups)
+    groups = rebalance_groups_by_duration(df_sorted, groups, depot_lat, depot_lon, target_gap=45)
+    totals = []
+    for group in groups:
+        part = df_sorted.loc[group].copy()
+        _, _, total = stats_route(part, depot_lat, depot_lon)
+        totals.append(total)
+    return max(totals) if totals else 0
+
+
+def choose_auto_route_count(df, depot_lat, depot_lon, target_min=420, max_routes=40):
+    """
+    Choisit le plus petit nombre de tournées qui passe sous la cible.
+    Comme on prend le plus petit k possible, on évite de créer trop de tournées.
+    """
+    n = len(df)
+    if n == 0:
+        return 1, 0
+
+    min_routes = max(2, min(3, n))
+    best_k = min_routes
+    best_max = float("inf")
+
+    for k in range(min_routes, max_routes + 1):
+        max_duration = estimate_max_route_duration_for_k(df, k, depot_lat, depot_lon)
+        if max_duration < best_max:
+            best_k = k
+            best_max = max_duration
+        if max_duration <= target_min:
+            return k, max_duration
+
+    return best_k, best_max
+
+
 def is_open_at(row, minute_value):
     if row.get("type") == "Casier / Locker":
         return True
@@ -509,6 +575,7 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
     df["hours_json"] = df["hours_json"].fillna("[]")
     df["has_lunch_break"] = df["has_lunch_break"].fillna(False).astype(bool)
     df["hours_source"] = df["hours_source"].fillna("missing")
+    df = add_hours_display_columns(df)
     return df
 
 
@@ -565,6 +632,91 @@ def route_order_with_hours(df_route, depot_lat, depot_lon, start_minute):
         remaining.remove(chosen)
 
     return order, eta_by_idx, status_by_idx
+
+
+def route_duration_for_group(df, group, depot_lat, depot_lon):
+    if not group:
+        return 0
+    part = df.loc[group].copy()
+    _, _, total = stats_route(part, depot_lat, depot_lon)
+    return float(total)
+
+
+def group_centroid(df, group):
+    if not group:
+        return None
+    return float(df.loc[group, "lat"].mean()), float(df.loc[group, "lon"].mean())
+
+
+def rebalance_groups_by_duration(df, groups, depot_lat, depot_lon, target_gap=45, max_iter=120):
+    """
+    Rééquilibre les tournées en fonction du temps total estimé, pas seulement du nombre de points.
+    Objectif : réduire l'écart max/min à environ 30-45 min, en évitant de créer une tournée trop vide.
+    """
+    groups = [list(g) for g in groups if g]
+    if len(groups) <= 1:
+        return groups
+
+    min_points = max(3, int(len(df) / len(groups) * 0.45))
+
+    def durations(gs):
+        return [route_duration_for_group(df, g, depot_lat, depot_lon) for g in gs]
+
+    for _ in range(max_iter):
+        ds = durations(groups)
+        current_gap = max(ds) - min(ds)
+        if current_gap <= target_gap:
+            break
+
+        hi = ds.index(max(ds))
+        lo = ds.index(min(ds))
+
+        if len(groups[hi]) <= min_points:
+            break
+
+        lo_centroid = group_centroid(df, groups[lo])
+        if lo_centroid is None:
+            lo_centroid = (depot_lat, depot_lon)
+
+        # On teste plusieurs candidats de la tournée la plus longue.
+        candidates = []
+        for point_idx in groups[hi]:
+            # On privilégie les points pas trop éloignés de la tournée courte.
+            d_to_lo = hav(df.loc[point_idx, "lat"], df.loc[point_idx, "lon"], lo_centroid[0], lo_centroid[1])
+            candidates.append((d_to_lo, point_idx))
+
+        candidates = [p for _, p in sorted(candidates)[:12]]
+
+        best_move = None
+        best_gap = current_gap
+        best_max = max(ds)
+
+        for point_idx in candidates:
+            trial = [g[:] for g in groups]
+            trial[hi].remove(point_idx)
+            trial[lo].append(point_idx)
+
+            if len(trial[hi]) < min_points:
+                continue
+
+            trial_ds = durations(trial)
+            gap = max(trial_ds) - min(trial_ds)
+            mx = max(trial_ds)
+
+            # On accepte si l'écart baisse, ou si le max baisse nettement.
+            if gap < best_gap or (gap <= best_gap + 8 and mx < best_max):
+                best_gap = gap
+                best_max = mx
+                best_move = point_idx
+
+        if best_move is None:
+            break
+
+        groups[hi].remove(best_move)
+        groups[lo].append(best_move)
+
+    return groups
+
 
 
 # =========================
@@ -673,6 +825,7 @@ def improve_balance(df, groups):
 def optimise_balanced(df, k, center_code, depot_lat, depot_lon, mode_optimisation="Distance uniquement", heure_depart="08:00"):
     df_sorted, groups = balance_groups_by_service(df, k, depot_lat, depot_lon)
     groups = improve_balance(df_sorted, groups)
+    groups = rebalance_groups_by_duration(df_sorted, groups, depot_lat, depot_lon, target_gap=45)
 
     groups = sorted(
         groups,
@@ -757,8 +910,8 @@ button{cursor:pointer;margin-top:8px;background:#0f172a;color:#fff;border:0}butt
 .small{font-size:12px;color:#64748b;line-height:1.35}a{color:#2563eb;text-decoration:none;font-weight:700}.legend-dot{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:6px}
 .ok{background:#ecfdf5;border-color:#bbf7d0;color:#166534}.metric{display:inline-block;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:4px 7px;margin-top:4px}
 .badge{display:inline-block;padding:2px 7px;border-radius:999px;background:#dcfce7;color:#166534;font-size:11px;font-weight:800;margin-left:4px}.bad{background:#fee2e2;color:#991b1b}
-.map-legend{position:fixed;right:18px;bottom:18px;z-index:9999;background:rgba(255,255,255,.96);border:1px solid #cbd5e1;border-radius:14px;padding:10px 12px;box-shadow:0 4px 14px rgba(15,23,42,.18);font-size:12px;max-width:280px;line-height:1.35}
-.map-legend-row{display:flex;align-items:center;gap:7px;margin:4px 0}.map-legend-swatch{width:12px;height:12px;border-radius:999px;display:inline-block;flex:0 0 auto}
+.map-legend{position:fixed;right:10px;bottom:10px;z-index:9999;background:rgba(255,255,255,.90);border:1px solid #cbd5e1;border-radius:10px;padding:6px 8px;box-shadow:0 3px 10px rgba(15,23,42,.14);font-size:10px;width:205px;max-height:155px;overflow:auto;line-height:1.15}
+.map-legend-row{display:flex;align-items:flex-start;gap:4px;margin:2px 0}.map-legend-swatch{width:7px;height:7px;border-radius:999px;display:inline-block;flex:0 0 auto;margin-top:3px}.map-legend-name{display:inline-block;max-width:178px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
 @media(max-width:900px){.app{grid-template-columns:1fr}.sidebar{height:48vh}#map{height:52vh}}
 </style></head><body><div class="app"><aside class="sidebar">
 <h1>__CENTER__ — tournées optimisées</h1>
@@ -896,7 +1049,7 @@ function renderMarkers(){markersLayer.clearLayers();const rt=document.getElement
         <a target="_blank" href="${p.maps}">Ouvrir le point</a>
     `);});if(rt!=="ALL"&&shown.length)map.fitBounds(shown.map(p=>[p.lat,p.lon]),{padding:[25,25]});renderRouteList();}
 function renderRouteList(){document.getElementById("kpiPoints").textContent=POINTS.length;document.getElementById("kpiRoutes").textContent=routeIds().length;document.getElementById("kpiLockers").textContent=POINTS.filter(p=>p.type==="Casier / Locker").length;document.getElementById("kpiRelais").textContent=POINTS.filter(p=>p.type==="Point relais").length;const box=document.getElementById("routeList");box.innerHTML="<b>Résumé des tournées</b>";const totals=[];routeIds().forEach(r=>{const pts=POINTS.filter(p=>p.tournee===r).sort((a,b)=>a.ordre-b.ordre);const lockers=pts.filter(p=>p.type==="Casier / Locker").length;const relais=pts.length-lockers;const total=proxyTotal(pts);totals.push(total);const over=pts.length&&total>MAX_MIN;const url=googleLink(pts);const div=document.createElement("div");div.className="route-row";div.innerHTML=`<span class="swatch" style="background:${routeColor(r)}"></span><div><b>${r}</b> — ${routeDisplayName(r)} ${over?'<span class="badge bad">> 7h</span>':'<span class="badge">≤ 7h</span>'}<br><span class="small">${pts.length} pts · ${lockers} lockers · ${relais} relais · service ${Math.round(serviceSum(pts))} min</span><br><span class="metric">Prévisionnel ${Math.round(total)} min</span> <span class="metric">${proxyKm(pts).toFixed(1)} km proxy</span><br>${url?`<a target="_blank" href="${url}">Google Maps complet sans péage</a>`:""}</div>`;box.appendChild(div);});document.getElementById("balanceInfo").innerHTML=`Tournées : <b>${routeIds().length}</b>. Max prévisionnel : <b>${Math.round(Math.max(...totals))} min</b>. Moyenne : <b>${Math.round(totals.reduce((a,b)=>a+b,0)/totals.length)} min</b>.`;renderLegend();}
-function renderLegend(){document.getElementById("mapLegend").innerHTML="<b>Légende des tournées</b>"+routeIds().map(r=>`<div class="map-legend-row"><span class="map-legend-swatch" style="background:${routeColor(r)}"></span><span><b style="display:inline">${r}</b> — ${routeDisplayName(r).replace(/^T\d+\s*-\s*/,'')} (${POINTS.filter(p=>p.tournee===r).length})</span></div>`).join("")+'<div class="small" style="margin-top:6px">Contour bleu = locker · contour orange = point relais</div>';}
+function renderLegend(){document.getElementById("mapLegend").innerHTML="<b style=\"font-size:10px\">Légende</b>"+routeIds().map(r=>{const name=routeDisplayName(r);return `<div class="map-legend-row" title="${name}"><span class="map-legend-swatch" style="background:${routeColor(r)}"></span><span class="map-legend-name"><b style="display:inline">${r}</b> — ${name.replace(/^T\d+\s*-\s*/,'')} (${POINTS.filter(p=>p.tournee===r).length})</span></div>`}).join("")+'<div class="small" style="margin-top:4px;font-size:10px">Bleu=locker · orange=relais</div>';}
 function renumberRoute(r){POINTS.filter(p=>p.tournee===r).sort((a,b)=>a.ordre-b.ordre).forEach((p,i)=>p.ordre=i+1);}
 function moveSelectedPointManual(){const code=document.getElementById("manualPoint").value,target=document.getElementById("manualTargetRoute").value,p=POINTS.find(x=>String(x.code)===String(code));if(!code||!p||!target)return;const source=p.tournee;p.tournee=target;p.nom_tournee=routeDisplayName(target);renumberRoute(source);renumberRoute(target);autoSaveScenario();document.getElementById("manualInfo").textContent=`Point ${code} déplacé de ${source} vers ${target}. Modif sauvegardée sur ce compte.`;renderSelectors();renderMarkers();}
 function nextRouteId(){let maxId=0;routeIds().forEach(r=>{const m=String(r).match(/T(\d+)/);if(m)maxId=Math.max(maxId,parseInt(m[1],10));});return "T"+String(maxId+1).padStart(2,"0");}
@@ -1003,7 +1156,17 @@ with st.sidebar:
     depot_lon = st.number_input("Longitude dépôt", value=float(cfg["depot_lon"]), format="%.7f")
     depot_addr = st.text_input("Adresse dépôt", value=cfg["depot_addr"])
 
-    nb_tournees = st.number_input("Nombre de tournées", min_value=2, max_value=15, value=int(cfg["default_routes"]))
+    auto_nb_tournees = st.checkbox("Détecter automatiquement le nombre de tournées", value=True)
+    target_route_min = st.number_input("Durée cible max par tournée (min)", min_value=300, max_value=600, value=420, step=15)
+    max_auto_routes = st.number_input("Maximum de tournées autorisées", min_value=5, max_value=60, value=40, step=1)
+
+    nb_tournees = st.number_input(
+        "Nombre de tournées manuel",
+        min_value=2,
+        max_value=60,
+        value=int(cfg["default_routes"]),
+        disabled=auto_nb_tournees,
+    )
 
     mode_optimisation = st.radio(
         "Mode d’optimisation",
@@ -1083,10 +1246,19 @@ if df is not None and not df.empty:
     c.metric("Relais", int((df["type"] == "Point relais").sum()))
     d.metric("Batch", str(df["batch_id"].iloc[0]) if "batch_id" in df else "-")
 
-    st.dataframe(df, use_container_width=True, height=230)
-    if "hours_source" in df.columns:
-        st.caption("Horaires : cache chargé / récupéré pour les points.")
-        st.write(df["hours_source"].value_counts())
+    display_df = df.copy()
+    if "hours_json" in display_df.columns and "horaires_ouverture" not in display_df.columns:
+        display_df = add_hours_display_columns(display_df)
+    preferred_cols = [
+        "code", "type", "nom", "adresse", "ville", "code_postal",
+        "horaires_ouverture", "pause_midi_detectee", "hours_source",
+        "lat", "lon", "maps"
+    ]
+    cols = [c for c in preferred_cols if c in display_df.columns] + [c for c in display_df.columns if c not in preferred_cols]
+    st.dataframe(display_df[cols], use_container_width=True, height=260)
+    if "hours_source" in display_df.columns:
+        st.caption("Horaires : affichés après récupération/cache des horaires. Si les colonnes sont vides, lance le mode Horaires d'ouverture + distance.")
+        st.write(display_df["hours_source"].value_counts())
 
     if opt_btn:
         try:
@@ -1109,10 +1281,23 @@ if df is not None and not df.empty:
             else:
                 mode_used = mode_optimisation
 
+            with st.spinner("Détection du nombre de tournées..." if auto_nb_tournees else "Préparation optimisation..."):
+                if auto_nb_tournees:
+                    selected_k, estimated_max = choose_auto_route_count(
+                        df_for_opt,
+                        depot_lat,
+                        depot_lon,
+                        target_min=int(target_route_min),
+                        max_routes=int(max_auto_routes),
+                    )
+                    st.info(f"Nombre de tournées détecté : {selected_k} — durée max estimée avant optimisation fine : {round(estimated_max)} min.")
+                else:
+                    selected_k = int(nb_tournees)
+
             with st.spinner("Optimisation équilibrée rapide..."):
                 opt, summary = optimise_balanced(
                     df_for_opt,
-                    int(nb_tournees),
+                    selected_k,
                     selected_center,
                     depot_lat,
                     depot_lon,
@@ -1121,7 +1306,7 @@ if df is not None and not df.empty:
                 )
                 st.session_state.opt = opt
                 st.session_state.summary = summary
-            st.success(f"Optimisation terminée — mode : {mode_used}.")
+            st.success(f"Optimisation terminée — mode : {mode_used} — {selected_k} tournées.")
         except Exception as e:
             st.error(str(e))
 
@@ -1129,6 +1314,11 @@ if st.session_state.opt is not None and not st.session_state.opt.empty:
     opt = st.session_state.opt
     summary = st.session_state.summary
     st.subheader("Résumé des tournées")
+    if "temps_total_min" in summary.columns and not summary.empty:
+        ecart = float(summary["temps_total_min"].max() - summary["temps_total_min"].min())
+        st.metric("Écart max/min entre tournées", f"{round(ecart)} min")
+        if ecart > 45:
+            st.warning("Écart supérieur à 45 min : tu peux augmenter légèrement le nombre de tournées ou ajuster manuellement certains points.")
     st.dataframe(summary, use_container_width=True)
 
     html = build_map_html(opt, selected_center, depot_lat, depot_lon, depot_addr, st.session_state.username)
