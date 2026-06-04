@@ -378,11 +378,27 @@ def parse_hours_from_rsc_text(text):
     return out
 
 
+def clean_admin_cookie(admin_cookie):
+    """
+    Nettoie le cookie copié depuis Copy as cURL Windows.
+    Supprime les ^ et tente de corriger les noms de cookies NextAuth si les underscores ont sauté.
+    """
+    cookie = str(admin_cookie or "").strip().strip('"').strip("'")
+    cookie = cookie.replace("^", "")
+    cookie = cookie.replace("%^", "%")
+    cookie = cookie.replace(" Secure-next-auth.", " __Secure-next-auth.")
+    cookie = cookie.replace("; Secure-next-auth.", "; __Secure-next-auth.")
+    if cookie.startswith("Secure-next-auth."):
+        cookie = "__" + cookie
+    return cookie
+
+
 def fetch_working_hours_for_point(point_id, admin_cookie):
     """
     Appelle la page admin du point et extrait les horaires.
     Nécessite VINTED_ADMIN_COOKIE dans les secrets Streamlit.
     """
+    admin_cookie = clean_admin_cookie(admin_cookie)
     if not admin_cookie:
         return []
 
@@ -396,7 +412,7 @@ def fetch_working_hours_for_point(point_id, admin_cookie):
         "user-agent": "Mozilla/5.0",
     }
 
-    r = requests.get(url, headers=h, timeout=25)
+    r = requests.get(url, headers=h, timeout=8)
     if r.status_code in (401, 403):
         raise RuntimeError("Cookie admin VintedGo expiré ou non autorisé. Remplace VINTED_ADMIN_COOKIE dans les secrets.")
     r.raise_for_status()
@@ -513,10 +529,11 @@ def is_open_at(row, minute_value):
     return False
 
 
-def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False):
+def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False, max_fetch=30):
     """
     Récupère les horaires des points et les met en cache par point_id/code.
-    Les lockers sont considérés comme flexibles.
+    Pour éviter les blocages sur LIL3, on ne scrape qu'un nombre limité de points manquants par clic.
+    Les points sans horaires restent utilisables et n'empêchent pas l'optimisation.
     """
     df = df.copy()
     cache_path = DATA_DIR / f"working_hours_cache_{center_code}.csv"
@@ -529,17 +546,26 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
     existing = set(cache["point_id"].astype(str).tolist()) if not cache.empty else set()
     new_rows = []
 
+    rows_to_fetch = []
     for row in df.itertuples(index=False):
+        point_id = getattr(row, "point_id", None)
+        if pd.isna(point_id):
+            continue
+        pid = str(int(point_id)) if str(point_id).replace(".0", "").isdigit() else str(point_id)
+        if pid not in existing or force_refresh:
+            rows_to_fetch.append(row)
+
+    total_missing = len(rows_to_fetch)
+    rows_to_fetch = rows_to_fetch[:max(0, int(max_fetch))]
+
+    progress = st.progress(0, text=f"Récupération horaires : 0/{len(rows_to_fetch)}") if rows_to_fetch else None
+
+    for i, row in enumerate(rows_to_fetch, start=1):
         point_id = getattr(row, "point_id", None)
         code = getattr(row, "code", "")
         point_type = getattr(row, "type", "")
 
-        if pd.isna(point_id):
-            continue
-
         pid = str(int(point_id)) if str(point_id).replace(".0", "").isdigit() else str(point_id)
-        if pid in existing and not force_refresh:
-            continue
 
         if point_type == "Casier / Locker":
             intervals = [{"day": "unknown", "opens_at": "00:00", "closes_at": "23:59"}]
@@ -547,7 +573,7 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
         else:
             try:
                 intervals = fetch_working_hours_for_point(point_id, admin_cookie)
-                source = "admin_rsc"
+                source = "admin_rsc" if intervals else "admin_rsc_empty"
             except Exception as e:
                 intervals = []
                 source = f"error: {str(e)[:120]}"
@@ -560,6 +586,12 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
             "has_lunch_break": bool(has_lunch),
             "hours_source": source,
         })
+
+        if progress:
+            progress.progress(i / len(rows_to_fetch), text=f"Récupération horaires : {i}/{len(rows_to_fetch)}")
+
+    if progress:
+        progress.empty()
 
     if new_rows:
         cache = pd.concat([cache, pd.DataFrame(new_rows)], ignore_index=True)
@@ -576,6 +608,9 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
     df["has_lunch_break"] = df["has_lunch_break"].fillna(False).astype(bool)
     df["hours_source"] = df["hours_source"].fillna("missing")
     df = add_hours_display_columns(df)
+
+    cached_count = int((df["hours_source"] != "missing").sum())
+    st.caption(f"Horaires : {cached_count}/{len(df)} points ont une info en cache. {total_missing} manquants avant ce clic, {len(new_rows)} récupérés maintenant.")
     return df
 
 
@@ -1156,16 +1191,16 @@ with st.sidebar:
     depot_lon = st.number_input("Longitude dépôt", value=float(cfg["depot_lon"]), format="%.7f")
     depot_addr = st.text_input("Adresse dépôt", value=cfg["depot_addr"])
 
-    auto_nb_tournees = st.checkbox("Détecter automatiquement le nombre de tournées", value=True)
+    auto_nb_tournees = st.checkbox("Utiliser le nombre de tournées détecté automatiquement", value=True)
     target_route_min = st.number_input("Durée cible max par tournée (min)", min_value=300, max_value=600, value=420, step=15)
     max_auto_routes = st.number_input("Maximum de tournées autorisées", min_value=5, max_value=60, value=40, step=1)
 
     nb_tournees = st.number_input(
-        "Nombre de tournées manuel",
+        "Nombre de tournées manuel / ajustement",
         min_value=2,
         max_value=60,
         value=int(cfg["default_routes"]),
-        disabled=auto_nb_tournees,
+        help="Décoche l’option automatique si tu veux forcer ce nombre après avoir vu la suggestion."
     )
 
     mode_optimisation = st.radio(
@@ -1178,14 +1213,16 @@ with st.sidebar:
     heure_depart = heure_depart_obj.strftime("%H:%M")
 
     force_hours_refresh = st.checkbox("Forcer la mise à jour des horaires", value=False)
+    st.caption("Le bouton « Récupérer horaires » charge tous les horaires manquants en une seule fois, avec une barre de progression.")
 
     manual_batch = st.text_input("Batch ID manuel (optionnel)", value="")
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 auto = col1.button("Actualiser dernière tournée", type="primary")
 manual = col2.button("Synchroniser Batch ID")
 load = col3.button("Charger fichier local")
-opt_btn = col4.button("Optimiser équilibré")
+hours_btn = col4.button("Récupérer horaires")
+opt_btn = col5.button("Optimiser équilibré")
 
 for key in ["df", "opt", "summary", "batches_df"]:
     if key not in st.session_state:
@@ -1202,6 +1239,17 @@ if auto:
 
         with st.spinner(f"Scraping {selected_center} batch {latest_id}..."):
             st.session_state.df = fetch_points(TOKEN, latest_id, selected_center)
+            if ADMIN_COOKIE:
+                try:
+                    st.session_state.df = enrich_points_with_hours(
+                        st.session_state.df,
+                        selected_center,
+                        ADMIN_COOKIE,
+                        force_refresh=False,
+                        max_fetch=0,
+                    )
+                except Exception:
+                    pass
             st.session_state.opt = None
             st.session_state.summary = None
         st.success(f"{len(st.session_state.df)} points récupérés pour {selected_center}.")
@@ -1216,6 +1264,17 @@ if manual:
             raise RuntimeError("Indique un Batch ID manuel.")
         with st.spinner(f"Scraping {selected_center} batch {manual_batch}..."):
             st.session_state.df = fetch_points(TOKEN, manual_batch, selected_center)
+            if ADMIN_COOKIE:
+                try:
+                    st.session_state.df = enrich_points_with_hours(
+                        st.session_state.df,
+                        selected_center,
+                        ADMIN_COOKIE,
+                        force_refresh=False,
+                        max_fetch=0,
+                    )
+                except Exception:
+                    pass
             st.session_state.opt = None
             st.session_state.summary = None
         st.success(f"{len(st.session_state.df)} points récupérés pour {selected_center}.")
@@ -1226,11 +1285,45 @@ if load:
     p = DATA_DIR / f"points_vinted_latest_{selected_center}.csv"
     if p.exists():
         st.session_state.df = pd.read_csv(p)
+        # Recharge seulement les horaires déjà en cache, sans scraper de nouveaux points.
+        if ADMIN_COOKIE:
+            try:
+                st.session_state.df = enrich_points_with_hours(
+                    st.session_state.df,
+                    selected_center,
+                    ADMIN_COOKIE,
+                    force_refresh=False,
+                    max_fetch=0,
+                )
+            except Exception:
+                pass
         st.session_state.opt = None
         st.session_state.summary = None
         st.success("Fichier local chargé.")
     else:
         st.error("Aucun fichier local trouvé pour ce centre.")
+
+
+if hours_btn:
+    try:
+        if st.session_state.df is None or st.session_state.df.empty:
+            raise RuntimeError("Récupère d’abord les points VintedGo avant de récupérer les horaires.")
+        if not ADMIN_COOKIE:
+            raise RuntimeError("VINTED_ADMIN_COOKIE manquant dans les secrets Streamlit.")
+
+        with st.spinner("Récupération/cache des horaires des points relais..."):
+            st.session_state.df = enrich_points_with_hours(
+                st.session_state.df,
+                selected_center,
+                ADMIN_COOKIE,
+                force_refresh=force_hours_refresh,
+                max_fetch=len(st.session_state.df) + 100,
+            )
+            st.session_state.opt = None
+            st.session_state.summary = None
+        st.success("Horaires récupérés / mis à jour. Tu peux maintenant optimiser en mode horaires.")
+    except Exception as e:
+        st.error(str(e))
 
 if st.session_state.batches_df is not None:
     st.subheader("Batchs détectés")
@@ -1257,7 +1350,7 @@ if df is not None and not df.empty:
     cols = [c for c in preferred_cols if c in display_df.columns] + [c for c in display_df.columns if c not in preferred_cols]
     st.dataframe(display_df[cols], use_container_width=True, height=260)
     if "hours_source" in display_df.columns:
-        st.caption("Horaires : affichés après récupération/cache des horaires. Si les colonnes sont vides, lance le mode Horaires d'ouverture + distance.")
+        st.caption("Horaires : clique sur « Récupérer horaires » pour remplir/mettre à jour ces colonnes. Le cache est réutilisé automatiquement ensuite.")
         st.write(display_df["hours_source"].value_counts())
 
     if opt_btn:
@@ -1265,19 +1358,14 @@ if df is not None and not df.empty:
             df_for_opt = df.copy()
 
             if mode_optimisation == "Horaires d'ouverture + distance":
-                if not ADMIN_COOKIE:
-                    st.warning("VINTED_ADMIN_COOKIE n’est pas renseigné : optimisation horaires impossible, passage en distance uniquement.")
-                    mode_used = "Distance uniquement"
-                else:
-                    mode_used = mode_optimisation
-                    with st.spinner("Récupération/cache des horaires des points..."):
-                        df_for_opt = enrich_points_with_hours(
-                            df_for_opt,
-                            selected_center,
-                            ADMIN_COOKIE,
-                            force_refresh=force_hours_refresh,
-                        )
-                        st.session_state.df = df_for_opt
+                mode_used = mode_optimisation
+                if "hours_json" not in df_for_opt.columns:
+                    st.warning("Les horaires ne sont pas encore chargés. Clique d'abord sur « Récupérer horaires ». Optimisation lancée avec les horaires manquants considérés comme ouverts.")
+                    df_for_opt["hours_json"] = "[]"
+                    df_for_opt["has_lunch_break"] = False
+                    df_for_opt["hours_source"] = "missing"
+                if "horaires_ouverture" not in df_for_opt.columns:
+                    df_for_opt = add_hours_display_columns(df_for_opt)
             else:
                 mode_used = mode_optimisation
 
@@ -1290,7 +1378,7 @@ if df is not None and not df.empty:
                         target_min=int(target_route_min),
                         max_routes=int(max_auto_routes),
                     )
-                    st.info(f"Nombre de tournées détecté : {selected_k} — durée max estimée avant optimisation fine : {round(estimated_max)} min.")
+                    st.info(f"Nombre de tournées conseillé : {selected_k} — durée max estimée avant optimisation fine : {round(estimated_max)} min. Pour forcer un autre nombre, décoche l’option automatique et modifie le champ manuel.")
                 else:
                     selected_k = int(nb_tournees)
 
