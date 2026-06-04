@@ -603,6 +603,82 @@ def improve_balance(df, groups):
     return groups
 
 
+
+def route_duration_for_group(df, group, depot_lat, depot_lon):
+    if not group:
+        return 0
+    part = df.loc[group].copy()
+    _, _, total = stats_route(part, depot_lat, depot_lon)
+    return float(total)
+
+
+def rebalance_groups_by_duration(df, groups, depot_lat, depot_lon, target_gap=45, max_iter=60):
+    """
+    Fonction safe distance-only.
+    Rééquilibre légèrement les groupes en fonction du temps estimé.
+    Si impossible, renvoie les groupes tels quels sans faire planter l'application.
+    """
+    try:
+        groups = [list(g) for g in groups if g]
+        if len(groups) <= 1:
+            return groups
+
+        min_points = max(3, int(len(df) / len(groups) * 0.45))
+
+        def durations(gs):
+            return [route_duration_for_group(df, g, depot_lat, depot_lon) for g in gs]
+
+        for _ in range(max_iter):
+            ds = durations(groups)
+            if not ds:
+                break
+            current_gap = max(ds) - min(ds)
+            if current_gap <= target_gap:
+                break
+
+            hi = ds.index(max(ds))
+            lo = ds.index(min(ds))
+
+            if len(groups[hi]) <= min_points:
+                break
+
+            best_move = None
+            best_gap = current_gap
+
+            # Teste les points les moins coûteux à déplacer, en limitant pour rester rapide.
+            candidates = groups[hi][:8] + groups[hi][-8:]
+            seen = []
+            for c in candidates:
+                if c not in seen:
+                    seen.append(c)
+
+            for point_idx in seen:
+                trial = [g[:] for g in groups]
+                if point_idx not in trial[hi]:
+                    continue
+                trial[hi].remove(point_idx)
+                trial[lo].append(point_idx)
+
+                if len(trial[hi]) < min_points:
+                    continue
+
+                tds = durations(trial)
+                gap = max(tds) - min(tds)
+                if gap < best_gap:
+                    best_gap = gap
+                    best_move = point_idx
+
+            if best_move is None:
+                break
+
+            groups[hi].remove(best_move)
+            groups[lo].append(best_move)
+
+        return groups
+    except Exception:
+        return groups
+
+
 def optimise_balanced(df, k, center_code, depot_lat, depot_lon, mode_optimisation="Distance uniquement", heure_depart="08:00"):
     df_sorted, groups = balance_groups_by_service(df, k, depot_lat, depot_lon)
     groups = improve_balance(df_sorted, groups)
