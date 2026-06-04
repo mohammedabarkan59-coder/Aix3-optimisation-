@@ -339,41 +339,44 @@ def intervals_have_lunch_break(intervals):
 def parse_hours_from_rsc_text(text):
     """
     Extrait les horaires depuis la réponse RSC Next.js.
-    On cherche les champs opens_at / closes_at observés dans le cURL.
+    Supporte les JSON normaux, les chaînes échappées du format RSC et les libellés 07:30 - 20:00.
     """
     if not text:
         return []
 
-    # Exemple observé : "opens_at":"07:30","closes_at":"20:00"
-    # On capture éventuellement day/name autour.
+    cleaned_versions = [
+        text,
+        text.replace('\\"', '"').replace("\\\\", "\\"),
+        text.replace("\\u0022", '"'),
+    ]
+
     entries = []
+    for raw in cleaned_versions:
+        pattern_day = re.compile(
+            r'"(?:day|weekday|day_name|name)"\s*:\s*"([^"]+)".{0,350}?"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,160}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
+            re.IGNORECASE | re.DOTALL,
+        )
+        for day, open_at, close_at in pattern_day.findall(raw):
+            entries.append({"day": day.lower(), "opens_at": open_at, "closes_at": close_at})
 
-    # Pattern avec un day avant opens/closes
-    pattern_day = re.compile(
-        r'"(?:day|weekday|day_name|name)"\s*:\s*"([^"]+)".{0,250}?"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,80}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
-        re.IGNORECASE | re.DOTALL,
-    )
-    for day, open_at, close_at in pattern_day.findall(text):
-        entries.append({"day": day.lower(), "opens_at": open_at, "closes_at": close_at})
+        pattern_simple = re.compile(
+            r'"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,200}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
+            re.IGNORECASE | re.DOTALL,
+        )
+        for open_at, close_at in pattern_simple.findall(raw):
+            entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
 
-    if entries:
-        return entries
+    if not entries:
+        pattern_label = re.compile(r'([0-2]\d:[0-5]\d)\s*-\s*([0-2]\d:[0-5]\d)')
+        for open_at, close_at in pattern_label.findall(text):
+            entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
 
-    # Fallback sans jour : on récupère toutes les paires horaires.
-    pattern_simple = re.compile(
-        r'"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,80}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
-        re.IGNORECASE | re.DOTALL,
-    )
-    for open_at, close_at in pattern_simple.findall(text):
-        entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
-
-    # Déduplication
     seen = set()
     out = []
     for e in entries:
-        key = (e["day"], e["opens_at"], e["closes_at"])
+        key = (str(e["day"]).lower(), e["opens_at"], e["closes_at"])
         if key not in seen:
-            out.append(e)
+            out.append({"day": key[0], "opens_at": e["opens_at"], "closes_at": e["closes_at"]})
             seen.add(key)
     return out
 
@@ -381,14 +384,18 @@ def parse_hours_from_rsc_text(text):
 def clean_admin_cookie(admin_cookie):
     """
     Nettoie le cookie copié depuis Copy as cURL Windows.
-    Supprime les ^ et tente de corriger les noms de cookies NextAuth si les underscores ont sauté.
+    Supprime les ^ et corrige les noms de cookies NextAuth si les underscores ont sauté.
     """
     cookie = str(admin_cookie or "").strip().strip('"').strip("'")
     cookie = cookie.replace("^", "")
     cookie = cookie.replace("%^", "%")
     cookie = cookie.replace(" Secure-next-auth.", " __Secure-next-auth.")
     cookie = cookie.replace("; Secure-next-auth.", "; __Secure-next-auth.")
+    cookie = cookie.replace(" Host-next-auth.", " __Host-next-auth.")
+    cookie = cookie.replace("; Host-next-auth.", "; __Host-next-auth.")
     if cookie.startswith("Secure-next-auth."):
+        cookie = "__" + cookie
+    if cookie.startswith("Host-next-auth."):
         cookie = "__" + cookie
     return cookie
 
@@ -398,6 +405,7 @@ def fetch_working_hours_for_point(point_id, admin_cookie):
     Appelle la page admin du point et extrait les horaires.
     Nécessite VINTED_ADMIN_COOKIE dans les secrets Streamlit.
     """
+    admin_cookie = clean_admin_cookie(admin_cookie)
     admin_cookie = clean_admin_cookie(admin_cookie)
     if not admin_cookie:
         return []
@@ -599,18 +607,43 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False,
         cache.to_csv(cache_path, index=False, encoding="utf-8-sig")
         cache.to_excel(DATA_DIR / f"working_hours_cache_{center_code}.xlsx", index=False)
 
-    # Merge
+    # Merge robuste : on enlève les anciennes colonnes horaires pour éviter hours_json_x / hours_json_y.
+    for col in ["hours_json", "has_lunch_break", "hours_source", "horaires_ouverture", "pause_midi_detectee"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+
+    if cache.empty:
+        cache = pd.DataFrame(columns=["point_id", "code", "hours_json", "has_lunch_break", "hours_source"])
+
+    for col in ["point_id", "hours_json", "has_lunch_break", "hours_source"]:
+        if col not in cache.columns:
+            cache[col] = None
+
     df["_pid"] = df["point_id"].apply(lambda x: str(int(x)) if pd.notna(x) and str(x).replace(".0", "").isdigit() else str(x))
     cache["_pid"] = cache["point_id"].astype(str)
     df = df.merge(cache[["_pid", "hours_json", "has_lunch_break", "hours_source"]], on="_pid", how="left")
     df = df.drop(columns=["_pid"], errors="ignore")
+
+    if "hours_json" not in df.columns:
+        df["hours_json"] = "[]"
+    if "has_lunch_break" not in df.columns:
+        df["has_lunch_break"] = False
+    if "hours_source" not in df.columns:
+        df["hours_source"] = "missing"
+
     df["hours_json"] = df["hours_json"].fillna("[]")
     df["has_lunch_break"] = df["has_lunch_break"].fillna(False).astype(bool)
     df["hours_source"] = df["hours_source"].fillna("missing")
     df = add_hours_display_columns(df)
 
     cached_count = int((df["hours_source"] != "missing").sum())
-    st.caption(f"Horaires : {cached_count}/{len(df)} points ont une info en cache. {total_missing} manquants avant ce clic, {len(new_rows)} récupérés maintenant.")
+    ok_count = int((df["hours_source"] == "admin_rsc").sum())
+    empty_count = int((df["hours_source"] == "admin_rsc_empty").sum())
+    error_count = int(df["hours_source"].astype(str).str.startswith("error:").sum())
+    st.caption(
+        f"Horaires : {cached_count}/{len(df)} infos en cache, dont {ok_count} récupérées correctement. "
+        f"{empty_count} vides, {error_count} erreurs. {total_missing} manquants avant chargement, {len(new_rows)} récupérés maintenant."
+    )
     return df
 
 
@@ -1213,7 +1246,14 @@ with st.sidebar:
     heure_depart = heure_depart_obj.strftime("%H:%M")
 
     force_hours_refresh = st.checkbox("Forcer la mise à jour des horaires", value=False)
-    st.caption("Le bouton « Récupérer horaires » charge tous les horaires manquants en une seule fois, avec une barre de progression.")
+    max_hours_fetch = st.number_input(
+        "Nb max d'horaires à récupérer par clic",
+        min_value=0,
+        max_value=250,
+        value=35,
+        step=5,
+        help="Pour LIL3, évite de scraper 200 points d’un coup. Relance l’optimisation plusieurs fois pour compléter le cache."
+    )
 
     manual_batch = st.text_input("Batch ID manuel (optionnel)", value="")
 
@@ -1317,7 +1357,7 @@ if hours_btn:
                 selected_center,
                 ADMIN_COOKIE,
                 force_refresh=force_hours_refresh,
-                max_fetch=len(st.session_state.df) + 100,
+                max_fetch=int(max_hours_fetch),
             )
             st.session_state.opt = None
             st.session_state.summary = None
@@ -1352,6 +1392,10 @@ if df is not None and not df.empty:
     if "hours_source" in display_df.columns:
         st.caption("Horaires : clique sur « Récupérer horaires » pour remplir/mettre à jour ces colonnes. Le cache est réutilisé automatiquement ensuite.")
         st.write(display_df["hours_source"].value_counts())
+        if (display_df["hours_source"].astype(str).str.startswith("error:")).any():
+            st.warning("Certaines récupérations horaires sont en erreur : vérifie que VINTED_ADMIN_COOKIE est complet et récent.")
+        if (display_df["hours_source"] == "admin_rsc_empty").any():
+            st.warning("Certains points n'ont pas renvoyé d'horaires lisibles : le cookie peut être incomplet/expiré ou la structure de page différente.")
 
     if opt_btn:
         try:
