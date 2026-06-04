@@ -94,12 +94,11 @@ CENTERS = {
         # Coordonnées par défaut approximatives sur Roncq. Ajustables dans les secrets.
         "depot_lat": float(get_secret("LIL3_DEPOT_LAT", "50.746301")),
         "depot_lon": float(get_secret("LIL3_DEPOT_LON", "3.115632")),
-        "default_routes": int(get_secret("LIL3_DEFAULT_ROUTES", "6")),
+        "default_routes": int(get_secret("LIL3_DEFAULT_ROUTES", "14")),
     },
 }
 
 TOKEN = get_secret("VINTED_TOKEN", "")
-ADMIN_COOKIE = get_secret("VINTED_ADMIN_COOKIE", "")
 
 AVG_SPEED = 50
 ROAD_FACTOR = 1.15
@@ -339,65 +338,43 @@ def intervals_have_lunch_break(intervals):
 def parse_hours_from_rsc_text(text):
     """
     Extrait les horaires depuis la réponse RSC Next.js.
-    Supporte les JSON normaux, les chaînes échappées du format RSC et les libellés 07:30 - 20:00.
+    On cherche les champs opens_at / closes_at observés dans le cURL.
     """
     if not text:
         return []
 
-    cleaned_versions = [
-        text,
-        text.replace('\\"', '"').replace("\\\\", "\\"),
-        text.replace("\\u0022", '"'),
-    ]
-
+    # Exemple observé : "opens_at":"07:30","closes_at":"20:00"
+    # On capture éventuellement day/name autour.
     entries = []
-    for raw in cleaned_versions:
-        pattern_day = re.compile(
-            r'"(?:day|weekday|day_name|name)"\s*:\s*"([^"]+)".{0,350}?"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,160}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
-            re.IGNORECASE | re.DOTALL,
-        )
-        for day, open_at, close_at in pattern_day.findall(raw):
-            entries.append({"day": day.lower(), "opens_at": open_at, "closes_at": close_at})
 
-        pattern_simple = re.compile(
-            r'"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,200}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
-            re.IGNORECASE | re.DOTALL,
-        )
-        for open_at, close_at in pattern_simple.findall(raw):
-            entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
+    # Pattern avec un day avant opens/closes
+    pattern_day = re.compile(
+        r'"(?:day|weekday|day_name|name)"\s*:\s*"([^"]+)".{0,250}?"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,80}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for day, open_at, close_at in pattern_day.findall(text):
+        entries.append({"day": day.lower(), "opens_at": open_at, "closes_at": close_at})
 
-    if not entries:
-        pattern_label = re.compile(r'([0-2]\d:[0-5]\d)\s*-\s*([0-2]\d:[0-5]\d)')
-        for open_at, close_at in pattern_label.findall(text):
-            entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
+    if entries:
+        return entries
 
+    # Fallback sans jour : on récupère toutes les paires horaires.
+    pattern_simple = re.compile(
+        r'"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,80}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for open_at, close_at in pattern_simple.findall(text):
+        entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
+
+    # Déduplication
     seen = set()
     out = []
     for e in entries:
-        key = (str(e["day"]).lower(), e["opens_at"], e["closes_at"])
+        key = (e["day"], e["opens_at"], e["closes_at"])
         if key not in seen:
-            out.append({"day": key[0], "opens_at": e["opens_at"], "closes_at": e["closes_at"]})
+            out.append(e)
             seen.add(key)
     return out
-
-
-def clean_admin_cookie(admin_cookie):
-    """
-    Nettoie le cookie copié depuis Copy as cURL Windows.
-    Supprime les ^ et corrige les noms de cookies NextAuth si les underscores ont sauté.
-    """
-    cookie = str(admin_cookie or "").strip().strip('"').strip("'")
-    cookie = cookie.replace("^", "")
-    cookie = cookie.replace("%^", "%")
-    cookie = cookie.replace(" Secure-next-auth.", " __Secure-next-auth.")
-    cookie = cookie.replace("; Secure-next-auth.", "; __Secure-next-auth.")
-    cookie = cookie.replace(" Host-next-auth.", " __Host-next-auth.")
-    cookie = cookie.replace("; Host-next-auth.", "; __Host-next-auth.")
-    if cookie.startswith("Secure-next-auth."):
-        cookie = "__" + cookie
-    if cookie.startswith("Host-next-auth."):
-        cookie = "__" + cookie
-    return cookie
 
 
 def fetch_working_hours_for_point(point_id, admin_cookie):
@@ -405,8 +382,6 @@ def fetch_working_hours_for_point(point_id, admin_cookie):
     Appelle la page admin du point et extrait les horaires.
     Nécessite VINTED_ADMIN_COOKIE dans les secrets Streamlit.
     """
-    admin_cookie = clean_admin_cookie(admin_cookie)
-    admin_cookie = clean_admin_cookie(admin_cookie)
     if not admin_cookie:
         return []
 
@@ -420,7 +395,7 @@ def fetch_working_hours_for_point(point_id, admin_cookie):
         "user-agent": "Mozilla/5.0",
     }
 
-    r = requests.get(url, headers=h, timeout=8)
+    r = requests.get(url, headers=h, timeout=25)
     if r.status_code in (401, 403):
         raise RuntimeError("Cookie admin VintedGo expiré ou non autorisé. Remplace VINTED_ADMIN_COOKIE dans les secrets.")
     r.raise_for_status()
@@ -497,293 +472,31 @@ def estimate_max_route_duration_for_k(df, k, depot_lat, depot_lon):
 
 def choose_auto_route_count(df, depot_lat, depot_lon, target_min=420, max_routes=40):
     """
-    Choisit le plus petit nombre de tournées qui passe sous la cible.
-    Comme on prend le plus petit k possible, on évite de créer trop de tournées.
+    Version rapide pour la V1 manager :
+    estime directement un nombre cohérent de tournées sans tester 40 optimisations.
+    Principe :
+    - environ 20 points max par tournée ;
+    - contrainte service total ;
+    - puis on garde le plus petit nombre cohérent pour ne pas créer trop de tournées.
     """
     n = len(df)
     if n == 0:
         return 1, 0
 
-    min_routes = max(2, min(3, n))
-    best_k = min_routes
-    best_max = float("inf")
+    total_service = float(df["service"].sum()) if "service" in df.columns else n * 8
+    # On réserve une marge pour les trajets et les retours dépôt.
+    service_capacity = max(180, int(target_min) - 120)
 
-    for k in range(min_routes, max_routes + 1):
-        max_duration = estimate_max_route_duration_for_k(df, k, depot_lat, depot_lon)
-        if max_duration < best_max:
-            best_k = k
-            best_max = max_duration
-        if max_duration <= target_min:
-            return k, max_duration
+    k_by_points = math.ceil(n / 20)
+    k_by_service = math.ceil(total_service / service_capacity)
 
-    return best_k, best_max
+    k = max(2, k_by_points, k_by_service)
+    k = min(int(max_routes), k)
 
+    # Estimation rapide seulement informative.
+    estimated_max = (total_service / k) + 120
+    return k, estimated_max
 
-def is_open_at(row, minute_value):
-    if row.get("type") == "Casier / Locker":
-        return True
-
-    intervals = choose_intervals_for_day(row.get("hours_json", "[]"), row.get("scheduled_for"))
-    if not intervals:
-        # Si on n'a pas l'info, on ne bloque pas le point.
-        return True
-
-    m = int(round(minute_value))
-    for it in intervals:
-        o = time_to_min(it.get("opens_at"))
-        c = time_to_min(it.get("closes_at"))
-        if o is not None and c is not None and o <= m <= c:
-            return True
-    return False
-
-
-def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False, max_fetch=30):
-    """
-    Récupère les horaires des points et les met en cache par point_id/code.
-    Pour éviter les blocages sur LIL3, on ne scrape qu'un nombre limité de points manquants par clic.
-    Les points sans horaires restent utilisables et n'empêchent pas l'optimisation.
-    """
-    df = df.copy()
-    cache_path = DATA_DIR / f"working_hours_cache_{center_code}.csv"
-
-    if cache_path.exists() and not force_refresh:
-        cache = pd.read_csv(cache_path)
-    else:
-        cache = pd.DataFrame(columns=["point_id", "code", "hours_json", "has_lunch_break", "hours_source"])
-
-    existing = set(cache["point_id"].astype(str).tolist()) if not cache.empty else set()
-    new_rows = []
-
-    rows_to_fetch = []
-    for row in df.itertuples(index=False):
-        point_id = getattr(row, "point_id", None)
-        if pd.isna(point_id):
-            continue
-        pid = str(int(point_id)) if str(point_id).replace(".0", "").isdigit() else str(point_id)
-        if pid not in existing or force_refresh:
-            rows_to_fetch.append(row)
-
-    total_missing = len(rows_to_fetch)
-    rows_to_fetch = rows_to_fetch[:max(0, int(max_fetch))]
-
-    progress = st.progress(0, text=f"Récupération horaires : 0/{len(rows_to_fetch)}") if rows_to_fetch else None
-
-    for i, row in enumerate(rows_to_fetch, start=1):
-        point_id = getattr(row, "point_id", None)
-        code = getattr(row, "code", "")
-        point_type = getattr(row, "type", "")
-
-        pid = str(int(point_id)) if str(point_id).replace(".0", "").isdigit() else str(point_id)
-
-        if point_type == "Casier / Locker":
-            intervals = [{"day": "unknown", "opens_at": "00:00", "closes_at": "23:59"}]
-            source = "locker_default"
-        else:
-            try:
-                intervals = fetch_working_hours_for_point(point_id, admin_cookie)
-                source = "admin_rsc" if intervals else "admin_rsc_empty"
-            except Exception as e:
-                intervals = []
-                source = f"error: {str(e)[:120]}"
-
-        has_lunch = intervals_have_lunch_break(intervals)
-        new_rows.append({
-            "point_id": pid,
-            "code": code,
-            "hours_json": json.dumps(intervals, ensure_ascii=False),
-            "has_lunch_break": bool(has_lunch),
-            "hours_source": source,
-        })
-
-        if progress:
-            progress.progress(i / len(rows_to_fetch), text=f"Récupération horaires : {i}/{len(rows_to_fetch)}")
-
-    if progress:
-        progress.empty()
-
-    if new_rows:
-        cache = pd.concat([cache, pd.DataFrame(new_rows)], ignore_index=True)
-        cache = cache.drop_duplicates(subset=["point_id"], keep="last")
-        cache.to_csv(cache_path, index=False, encoding="utf-8-sig")
-        cache.to_excel(DATA_DIR / f"working_hours_cache_{center_code}.xlsx", index=False)
-
-    # Merge robuste : on enlève les anciennes colonnes horaires pour éviter hours_json_x / hours_json_y.
-    for col in ["hours_json", "has_lunch_break", "hours_source", "horaires_ouverture", "pause_midi_detectee"]:
-        if col in df.columns:
-            df = df.drop(columns=[col])
-
-    if cache.empty:
-        cache = pd.DataFrame(columns=["point_id", "code", "hours_json", "has_lunch_break", "hours_source"])
-
-    for col in ["point_id", "hours_json", "has_lunch_break", "hours_source"]:
-        if col not in cache.columns:
-            cache[col] = None
-
-    df["_pid"] = df["point_id"].apply(lambda x: str(int(x)) if pd.notna(x) and str(x).replace(".0", "").isdigit() else str(x))
-    cache["_pid"] = cache["point_id"].astype(str)
-    df = df.merge(cache[["_pid", "hours_json", "has_lunch_break", "hours_source"]], on="_pid", how="left")
-    df = df.drop(columns=["_pid"], errors="ignore")
-
-    if "hours_json" not in df.columns:
-        df["hours_json"] = "[]"
-    if "has_lunch_break" not in df.columns:
-        df["has_lunch_break"] = False
-    if "hours_source" not in df.columns:
-        df["hours_source"] = "missing"
-
-    df["hours_json"] = df["hours_json"].fillna("[]")
-    df["has_lunch_break"] = df["has_lunch_break"].fillna(False).astype(bool)
-    df["hours_source"] = df["hours_source"].fillna("missing")
-    df = add_hours_display_columns(df)
-
-    cached_count = int((df["hours_source"] != "missing").sum())
-    ok_count = int((df["hours_source"] == "admin_rsc").sum())
-    empty_count = int((df["hours_source"] == "admin_rsc_empty").sum())
-    error_count = int(df["hours_source"].astype(str).str.startswith("error:").sum())
-    st.caption(
-        f"Horaires : {cached_count}/{len(df)} infos en cache, dont {ok_count} récupérées correctement. "
-        f"{empty_count} vides, {error_count} erreurs. {total_missing} manquants avant chargement, {len(new_rows)} récupérés maintenant."
-    )
-    return df
-
-
-def route_order_with_hours(df_route, depot_lat, depot_lon, start_minute):
-    """
-    Ordre glouton :
-    - pénalise fortement les points fermés à l'heure estimée ;
-    - privilégie les points sensibles à la pause midi avant 12h ;
-    - départage ensuite par distance.
-    """
-    remaining = list(df_route.index)
-    order = []
-    eta_by_idx = {}
-    status_by_idx = {}
-
-    cur_lat, cur_lon = depot_lat, depot_lon
-    current_min = int(start_minute)
-
-    while remaining:
-        candidates = []
-
-        for i in remaining:
-            row = df_route.loc[i]
-            dist = hav(cur_lat, cur_lon, row["lat"], row["lon"]) * ROAD_FACTOR
-            travel_min = dist / AVG_SPEED * 60
-            arrival = current_min + travel_min
-
-            open_ok = is_open_at(row, arrival)
-            lunch_sensitive = bool(row.get("has_lunch_break", False)) and row.get("type") != "Casier / Locker"
-
-            penalty = 0
-            if not open_ok:
-                penalty += 10000
-
-            # Si le point ferme à midi, on essaie de le faire avant 12h.
-            if lunch_sensitive:
-                if current_min < 12 * 60 and arrival <= 12 * 60:
-                    penalty -= 200
-                elif 12 * 60 <= arrival <= 14 * 60:
-                    penalty += 5000
-                elif current_min < 12 * 60 and arrival > 12 * 60:
-                    penalty += 500
-
-            candidates.append((penalty + dist, i, arrival, open_ok, dist))
-
-        _, chosen, arrival, open_ok, _ = min(candidates, key=lambda x: x[0])
-        order.append(chosen)
-        eta_by_idx[chosen] = arrival
-        status_by_idx[chosen] = "ouvert" if open_ok else "fermé_estime"
-
-        service = float(df_route.loc[chosen, "service"])
-        current_min = int(round(arrival + service))
-        cur_lat, cur_lon = df_route.loc[chosen, "lat"], df_route.loc[chosen, "lon"]
-        remaining.remove(chosen)
-
-    return order, eta_by_idx, status_by_idx
-
-
-def route_duration_for_group(df, group, depot_lat, depot_lon):
-    if not group:
-        return 0
-    part = df.loc[group].copy()
-    _, _, total = stats_route(part, depot_lat, depot_lon)
-    return float(total)
-
-
-def group_centroid(df, group):
-    if not group:
-        return None
-    return float(df.loc[group, "lat"].mean()), float(df.loc[group, "lon"].mean())
-
-
-def rebalance_groups_by_duration(df, groups, depot_lat, depot_lon, target_gap=45, max_iter=120):
-    """
-    Rééquilibre les tournées en fonction du temps total estimé, pas seulement du nombre de points.
-    Objectif : réduire l'écart max/min à environ 30-45 min, en évitant de créer une tournée trop vide.
-    """
-    groups = [list(g) for g in groups if g]
-    if len(groups) <= 1:
-        return groups
-
-    min_points = max(3, int(len(df) / len(groups) * 0.45))
-
-    def durations(gs):
-        return [route_duration_for_group(df, g, depot_lat, depot_lon) for g in gs]
-
-    for _ in range(max_iter):
-        ds = durations(groups)
-        current_gap = max(ds) - min(ds)
-        if current_gap <= target_gap:
-            break
-
-        hi = ds.index(max(ds))
-        lo = ds.index(min(ds))
-
-        if len(groups[hi]) <= min_points:
-            break
-
-        lo_centroid = group_centroid(df, groups[lo])
-        if lo_centroid is None:
-            lo_centroid = (depot_lat, depot_lon)
-
-        # On teste plusieurs candidats de la tournée la plus longue.
-        candidates = []
-        for point_idx in groups[hi]:
-            # On privilégie les points pas trop éloignés de la tournée courte.
-            d_to_lo = hav(df.loc[point_idx, "lat"], df.loc[point_idx, "lon"], lo_centroid[0], lo_centroid[1])
-            candidates.append((d_to_lo, point_idx))
-
-        candidates = [p for _, p in sorted(candidates)[:12]]
-
-        best_move = None
-        best_gap = current_gap
-        best_max = max(ds)
-
-        for point_idx in candidates:
-            trial = [g[:] for g in groups]
-            trial[hi].remove(point_idx)
-            trial[lo].append(point_idx)
-
-            if len(trial[hi]) < min_points:
-                continue
-
-            trial_ds = durations(trial)
-            gap = max(trial_ds) - min(trial_ds)
-            mx = max(trial_ds)
-
-            # On accepte si l'écart baisse, ou si le max baisse nettement.
-            if gap < best_gap or (gap <= best_gap + 8 and mx < best_max):
-                best_gap = gap
-                best_max = mx
-                best_move = point_idx
-
-        if best_move is None:
-            break
-
-        groups[hi].remove(best_move)
-        groups[lo].append(best_move)
-
-    return groups
 
 
 
@@ -1199,7 +912,7 @@ renderSelectors();renderMarkers();if(POINTS.length)map.fitBounds(POINTS.map(p=>[
 # =========================
 
 st.set_page_config(page_title="VintedGo Multi-centres", layout="wide")
-st.title("VintedGo — optimisation multi-centres")
+st.title("VintedGo — optimisation distance multi-centres")
 
 allowed_centers = [c for c in st.session_state.allowed_centers if c in CENTERS]
 if not allowed_centers:
@@ -1224,7 +937,7 @@ with st.sidebar:
     depot_lon = st.number_input("Longitude dépôt", value=float(cfg["depot_lon"]), format="%.7f")
     depot_addr = st.text_input("Adresse dépôt", value=cfg["depot_addr"])
 
-    auto_nb_tournees = st.checkbox("Utiliser le nombre de tournées détecté automatiquement", value=True)
+    auto_nb_tournees = st.checkbox("Utiliser le nombre de tournées conseillé automatiquement", value=True)
     target_route_min = st.number_input("Durée cible max par tournée (min)", min_value=300, max_value=600, value=420, step=15)
     max_auto_routes = st.number_input("Maximum de tournées autorisées", min_value=5, max_value=60, value=40, step=1)
 
@@ -1233,36 +946,16 @@ with st.sidebar:
         min_value=2,
         max_value=60,
         value=int(cfg["default_routes"]),
-        help="Décoche l’option automatique si tu veux forcer ce nombre après avoir vu la suggestion."
-    )
-
-    mode_optimisation = st.radio(
-        "Mode d’optimisation",
-        ["Distance uniquement", "Horaires d'ouverture + distance"],
-        index=0,
-        help="Le mode horaires évite autant que possible les points relais fermés entre 12h et 14h, puis optimise par distance."
-    )
-    heure_depart_obj = st.time_input("Heure de départ", value=time(8, 0))
-    heure_depart = heure_depart_obj.strftime("%H:%M")
-
-    force_hours_refresh = st.checkbox("Forcer la mise à jour des horaires", value=False)
-    max_hours_fetch = st.number_input(
-        "Nb max d'horaires à récupérer par clic",
-        min_value=0,
-        max_value=250,
-        value=35,
-        step=5,
-        help="Pour LIL3, évite de scraper 200 points d’un coup. Relance l’optimisation plusieurs fois pour compléter le cache."
+        help="Décoche l’option automatique si tu veux forcer ce nombre."
     )
 
     manual_batch = st.text_input("Batch ID manuel (optionnel)", value="")
 
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4 = st.columns(4)
 auto = col1.button("Actualiser dernière tournée", type="primary")
 manual = col2.button("Synchroniser Batch ID")
 load = col3.button("Charger fichier local")
-hours_btn = col4.button("Récupérer horaires")
-opt_btn = col5.button("Optimiser équilibré")
+opt_btn = col4.button("Optimiser équilibré")
 
 for key in ["df", "opt", "summary", "batches_df"]:
     if key not in st.session_state:
@@ -1279,17 +972,6 @@ if auto:
 
         with st.spinner(f"Scraping {selected_center} batch {latest_id}..."):
             st.session_state.df = fetch_points(TOKEN, latest_id, selected_center)
-            if ADMIN_COOKIE:
-                try:
-                    st.session_state.df = enrich_points_with_hours(
-                        st.session_state.df,
-                        selected_center,
-                        ADMIN_COOKIE,
-                        force_refresh=False,
-                        max_fetch=0,
-                    )
-                except Exception:
-                    pass
             st.session_state.opt = None
             st.session_state.summary = None
         st.success(f"{len(st.session_state.df)} points récupérés pour {selected_center}.")
@@ -1304,17 +986,6 @@ if manual:
             raise RuntimeError("Indique un Batch ID manuel.")
         with st.spinner(f"Scraping {selected_center} batch {manual_batch}..."):
             st.session_state.df = fetch_points(TOKEN, manual_batch, selected_center)
-            if ADMIN_COOKIE:
-                try:
-                    st.session_state.df = enrich_points_with_hours(
-                        st.session_state.df,
-                        selected_center,
-                        ADMIN_COOKIE,
-                        force_refresh=False,
-                        max_fetch=0,
-                    )
-                except Exception:
-                    pass
             st.session_state.opt = None
             st.session_state.summary = None
         st.success(f"{len(st.session_state.df)} points récupérés pour {selected_center}.")
@@ -1325,45 +996,11 @@ if load:
     p = DATA_DIR / f"points_vinted_latest_{selected_center}.csv"
     if p.exists():
         st.session_state.df = pd.read_csv(p)
-        # Recharge seulement les horaires déjà en cache, sans scraper de nouveaux points.
-        if ADMIN_COOKIE:
-            try:
-                st.session_state.df = enrich_points_with_hours(
-                    st.session_state.df,
-                    selected_center,
-                    ADMIN_COOKIE,
-                    force_refresh=False,
-                    max_fetch=0,
-                )
-            except Exception:
-                pass
         st.session_state.opt = None
         st.session_state.summary = None
         st.success("Fichier local chargé.")
     else:
         st.error("Aucun fichier local trouvé pour ce centre.")
-
-
-if hours_btn:
-    try:
-        if st.session_state.df is None or st.session_state.df.empty:
-            raise RuntimeError("Récupère d’abord les points VintedGo avant de récupérer les horaires.")
-        if not ADMIN_COOKIE:
-            raise RuntimeError("VINTED_ADMIN_COOKIE manquant dans les secrets Streamlit.")
-
-        with st.spinner("Récupération/cache des horaires des points relais..."):
-            st.session_state.df = enrich_points_with_hours(
-                st.session_state.df,
-                selected_center,
-                ADMIN_COOKIE,
-                force_refresh=force_hours_refresh,
-                max_fetch=int(max_hours_fetch),
-            )
-            st.session_state.opt = None
-            st.session_state.summary = None
-        st.success("Horaires récupérés / mis à jour. Tu peux maintenant optimiser en mode horaires.")
-    except Exception as e:
-        st.error(str(e))
 
 if st.session_state.batches_df is not None:
     st.subheader("Batchs détectés")
@@ -1384,36 +1021,16 @@ if df is not None and not df.empty:
         display_df = add_hours_display_columns(display_df)
     preferred_cols = [
         "code", "type", "nom", "adresse", "ville", "code_postal",
-        "horaires_ouverture", "pause_midi_detectee", "hours_source",
         "lat", "lon", "maps"
     ]
     cols = [c for c in preferred_cols if c in display_df.columns] + [c for c in display_df.columns if c not in preferred_cols]
     st.dataframe(display_df[cols], use_container_width=True, height=260)
-    if "hours_source" in display_df.columns:
-        st.caption("Horaires : clique sur « Récupérer horaires » pour remplir/mettre à jour ces colonnes. Le cache est réutilisé automatiquement ensuite.")
-        st.write(display_df["hours_source"].value_counts())
-        if (display_df["hours_source"].astype(str).str.startswith("error:")).any():
-            st.warning("Certaines récupérations horaires sont en erreur : vérifie que VINTED_ADMIN_COOKIE est complet et récent.")
-        if (display_df["hours_source"] == "admin_rsc_empty").any():
-            st.warning("Certains points n'ont pas renvoyé d'horaires lisibles : le cookie peut être incomplet/expiré ou la structure de page différente.")
 
     if opt_btn:
         try:
             df_for_opt = df.copy()
 
-            if mode_optimisation == "Horaires d'ouverture + distance":
-                mode_used = mode_optimisation
-                if "hours_json" not in df_for_opt.columns:
-                    st.warning("Les horaires ne sont pas encore chargés. Clique d'abord sur « Récupérer horaires ». Optimisation lancée avec les horaires manquants considérés comme ouverts.")
-                    df_for_opt["hours_json"] = "[]"
-                    df_for_opt["has_lunch_break"] = False
-                    df_for_opt["hours_source"] = "missing"
-                if "horaires_ouverture" not in df_for_opt.columns:
-                    df_for_opt = add_hours_display_columns(df_for_opt)
-            else:
-                mode_used = mode_optimisation
-
-            with st.spinner("Détection du nombre de tournées..." if auto_nb_tournees else "Préparation optimisation..."):
+            with st.spinner("Détection rapide du nombre de tournées..." if auto_nb_tournees else "Préparation optimisation..."):
                 if auto_nb_tournees:
                     selected_k, estimated_max = choose_auto_route_count(
                         df_for_opt,
@@ -1422,23 +1039,27 @@ if df is not None and not df.empty:
                         target_min=int(target_route_min),
                         max_routes=int(max_auto_routes),
                     )
-                    st.info(f"Nombre de tournées conseillé : {selected_k} — durée max estimée avant optimisation fine : {round(estimated_max)} min. Pour forcer un autre nombre, décoche l’option automatique et modifie le champ manuel.")
+                    st.info(
+                        f"Nombre de tournées conseillé : {selected_k} "
+                        f"— estimation rapide max : {round(estimated_max)} min. "
+                        f"Pour forcer un autre nombre, décoche l’option automatique."
+                    )
                 else:
                     selected_k = int(nb_tournees)
 
-            with st.spinner("Optimisation équilibrée rapide..."):
+            with st.spinner("Optimisation distance équilibrée..."):
                 opt, summary = optimise_balanced(
                     df_for_opt,
                     selected_k,
                     selected_center,
                     depot_lat,
                     depot_lon,
-                    mode_optimisation=mode_used,
-                    heure_depart=heure_depart,
+                    mode_optimisation="Distance uniquement",
+                    heure_depart="08:00",
                 )
                 st.session_state.opt = opt
                 st.session_state.summary = summary
-            st.success(f"Optimisation terminée — mode : {mode_used} — {selected_k} tournées.")
+            st.success(f"Optimisation terminée — distance uniquement — {selected_k} tournées.")
         except Exception as e:
             st.error(str(e))
 
@@ -1461,4 +1082,4 @@ if st.session_state.opt is not None and not st.session_state.opt.empty:
 
     components.html(html, height=720, scrolling=False)
 else:
-    st.info("Choisis un centre, actualise la dernière tournée, puis clique sur Optimiser équilibré.")
+    st.info("Choisis un centre, actualise la dernière tournée, puis clique sur Optimiser équilibré. Version manager : optimisation distance uniquement.")
