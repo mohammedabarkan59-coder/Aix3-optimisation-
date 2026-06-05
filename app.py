@@ -434,7 +434,6 @@ def clean_admin_cookie(admin_cookie):
     cookie = str(admin_cookie or "").strip().strip('"').strip("'")
     cookie = cookie.replace("^", "")
     cookie = cookie.replace("%^", "%")
-    # Corrige les noms si un underscore a sauté au copier-coller.
     cookie = cookie.replace(" _Secure-next-auth.", " __Secure-next-auth.")
     cookie = cookie.replace("; _Secure-next-auth.", "; __Secure-next-auth.")
     cookie = cookie.replace(" Secure-next-auth.", " __Secure-next-auth.")
@@ -445,7 +444,6 @@ def clean_admin_cookie(admin_cookie):
 
 
 def make_next_router_state_tree(point_id):
-    # Header observé dans le Copy as cURL : il aide Next/RSC à renvoyer la bonne page working_hours.
     return (
         '%5B%22%22%2C%7B%22children%22%3A%5B%5B%22locale%22%2C%22fr%22%2C%22d%22%5D%2C'
         '%7B%22children%22%3A%5B%22(protected)%22%2C%7B%22children%22%3A%5B%22points%22%2C'
@@ -455,58 +453,74 @@ def make_next_router_state_tree(point_id):
     )
 
 
-def fetch_working_hours_for_point(point_id, admin_cookie):
-    """
-    Récupère les horaires d'un point via working_hours.
-    Essaie d'abord _rsc=1a6v3, qui correspond au dernier cURL fourni, puis fallback.
-    """
+def fetch_working_hours_response(point_id, admin_cookie):
+    """Retourne status, url, text brut pour diagnostic."""
     admin_cookie = clean_admin_cookie(admin_cookie)
     if not admin_cookie:
-        return []
+        return 0, "", ""
 
     pid = int(point_id)
-    base_url = f"https://admin.vintedgo.com/fr/points/{pid}?tab=working_hours"
+    base_path = f"/fr/points/{pid}?tab=working_hours"
+    base_url = f"https://admin.vintedgo.com{base_path}"
 
-    base_headers = {
+    headers_rsc = {
         "accept": "*/*",
         "accept-language": "fr,fr-FR;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
         "cookie": admin_cookie,
         "referer": base_url,
         "rsc": "1",
+        "next-url": base_path,
+        "next-router-state-tree": make_next_router_state_tree(pid),
         "sec-fetch-site": "same-origin",
         "sec-fetch-mode": "cors",
         "sec-fetch-dest": "empty",
         "user-agent": "Mozilla/5.0",
-        "next-router-state-tree": make_next_router_state_tree(pid),
+    }
+
+    headers_html = {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "fr,fr-FR;q=0.9,en;q=0.8",
+        "cookie": admin_cookie,
+        "referer": base_url,
+        "user-agent": "Mozilla/5.0",
     }
 
     attempts = [
-        (base_url + "&_rsc=1a6v3", base_headers),
-        (base_url + "&_rsc=1z0wy", base_headers),
-        (base_url, {k: v for k, v in base_headers.items() if k not in ["rsc", "next-router-state-tree"]}),
+        (base_url + "&_rsc=1a6v3", headers_rsc),
+        (base_url + "&_rsc=1z0wy", headers_rsc),
+        (base_url, headers_html),
     ]
 
-    last_text = ""
-    last_status = ""
+    last = (0, "", "")
     for url, headers_ in attempts:
-        r = requests.get(url, headers=headers_, timeout=12)
-        last_status = r.status_code
-        last_text = r.text or ""
+        try:
+            r = requests.get(url, headers=headers_, timeout=12, allow_redirects=False)
+            last = (r.status_code, url, r.text or "")
+            if r.status_code in (200, 204) and (r.text or ""):
+                return last
+        except Exception as e:
+            last = (0, url, str(e))
+    return last
 
-        if r.status_code in (401, 403):
-            raise RuntimeError("Cookie admin VintedGo expiré ou non autorisé. Remplace VINTED_ADMIN_COOKIE dans les secrets.")
-        if r.status_code >= 400:
-            continue
 
-        intervals = parse_hours_from_rsc_text(last_text)
-        if intervals:
-            return intervals
+def fetch_working_hours_for_point(point_id, admin_cookie):
+    status, url, text = fetch_working_hours_response(point_id, admin_cookie)
 
-    # Sauvegarde debug si aucun horaire trouvé.
+    if status in (401, 403):
+        raise RuntimeError("Cookie admin VintedGo expiré ou non autorisé. Remplace VINTED_ADMIN_COOKIE dans les secrets.")
+
+    intervals = parse_hours_from_rsc_text(text)
+    if intervals:
+        return intervals
+
     try:
         debug_dir = DATA_DIR / "debug_hours"
         debug_dir.mkdir(exist_ok=True)
-        (debug_dir / f"point_{pid}_status_{last_status}.txt").write_text(last_text[:20000], encoding="utf-8")
+        safe_status = str(status).replace("/", "_")
+        (debug_dir / f"point_{int(point_id)}_status_{safe_status}.txt").write_text(
+            f"URL={url}\nSTATUS={status}\n\n{text[:20000]}",
+            encoding="utf-8"
+        )
     except Exception:
         pass
 
@@ -1435,15 +1449,33 @@ if df is not None and not df.empty:
     d.metric("Batch", str(df["batch_id"].iloc[0]) if "batch_id" in df else "-")
 
     display_df = df.copy()
+    if "point_id" in display_df.columns:
+        display_df["working_hours_url"] = display_df["point_id"].apply(
+            lambda x: f"https://admin.vintedgo.com/fr/points/{int(x)}?tab=working_hours" if pd.notna(x) else ""
+        )
     if "hours_json" in display_df.columns and "horaires_ouverture" not in display_df.columns:
         display_df = add_hours_display_columns(display_df)
     preferred_cols = [
-        "code", "type", "nom", "adresse", "ville", "code_postal",
+        "point_id", "code", "type", "nom", "adresse", "ville", "code_postal",
         "horaires_ouverture", "pause_midi_detectee", "hours_source",
-        "lat", "lon", "maps"
+        "working_hours_url", "lat", "lon", "maps"
     ]
     cols = [c for c in preferred_cols if c in display_df.columns] + [c for c in display_df.columns if c not in preferred_cols]
     st.dataframe(display_df[cols], use_container_width=True, height=260)
+
+    if "point_id" in display_df.columns:
+        with st.expander("Diagnostic horaires d'un point", expanded=False):
+            sample_ids = display_df.loc[display_df.get("type", "") == "Point relais", "point_id"].dropna().astype(int).astype(str).tolist()
+            default_pid = sample_ids[0] if sample_ids else str(int(display_df["point_id"].dropna().iloc[0]))
+            diag_pid = st.text_input("Point ID à tester", value=default_pid)
+            if st.button("Tester ce point"):
+                try:
+                    status, url, raw_text = fetch_working_hours_response(diag_pid, ADMIN_COOKIE)
+                    intervals = parse_hours_from_rsc_text(raw_text)
+                    st.write({"status": status, "url": url, "intervals_found": intervals[:10], "raw_length": len(raw_text or "")})
+                    st.code((raw_text or "")[:2500])
+                except Exception as e:
+                    st.error(str(e))
     if "hours_source" in display_df.columns:
         st.caption("Diagnostic horaires")
         st.write(display_df["hours_source"].value_counts())
