@@ -381,8 +381,8 @@ def intervals_have_lunch_break(intervals):
 
 def parse_hours_from_rsc_text(text):
     """
-    Extrait les horaires depuis la réponse RSC/HTML VintedGo.
-    Cherche les champs opens_at / closes_at ou les libellés visuels 06:30 - 19:30.
+    Extrait les horaires depuis une réponse RSC/HTML VintedGo.
+    Gère JSON normal, RSC échappé, clés camelCase/snake_case, et libellés visuels.
     """
     if not text:
         return []
@@ -398,29 +398,28 @@ def parse_hours_from_rsc_text(text):
     time_re = r'([0-2]\d:[0-5]\d)'
 
     for raw in versions:
+        # Champs horaires avec ou sans guillemets autour des clés.
         patterns = [
-            rf'"opens_at"\s*:\s*"{time_re}".{{0,220}}?"closes_at"\s*:\s*"{time_re}"',
-            rf'"opensAt"\s*:\s*"{time_re}".{{0,220}}?"closesAt"\s*:\s*"{time_re}"',
-            rf'"(?:opening_time|open_time|starts_at|start_at)"\s*:\s*"{time_re}".{{0,220}}?"(?:closing_time|close_time|ends_at|end_at)"\s*:\s*"{time_re}"',
+            rf'["\']?opens_at["\']?\s*:\s*["\']{time_re}["\'].{{0,260}}?["\']?closes_at["\']?\s*:\s*["\']{time_re}["\']',
+            rf'["\']?opensAt["\']?\s*:\s*["\']{time_re}["\'].{{0,260}}?["\']?closesAt["\']?\s*:\s*["\']{time_re}["\']',
+            rf'["\']?(?:opening_time|open_time|starts_at|start_at)["\']?\s*:\s*["\']{time_re}["\'].{{0,260}}?["\']?(?:closing_time|close_time|ends_at|end_at)["\']?\s*:\s*["\']{time_re}["\']',
         ]
         for pat in patterns:
             for open_at, close_at in re.findall(pat, raw, flags=re.IGNORECASE | re.DOTALL):
                 entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
 
-        # Si le jour est visible près des horaires.
+        # Jour + libellé.
         pday = re.compile(
-            rf'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday).{{0,260}}?{time_re}\s*-\s*{time_re}',
+            rf'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday).{{0,500}}?{time_re}\s*-\s*{time_re}',
             re.IGNORECASE | re.DOTALL,
         )
         for day, open_at, close_at in pday.findall(raw):
             entries.append({"day": str(day).lower(), "opens_at": open_at, "closes_at": close_at})
 
-    # Fallback général : extrait tous les libellés HH:MM - HH:MM.
-    if not entries:
-        for open_at, close_at in re.findall(rf'{time_re}\s*-\s*{time_re}', text):
+        # Fallback tous les HH:MM - HH:MM.
+        for open_at, close_at in re.findall(rf'{time_re}\s*-\s*{time_re}', raw):
             entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
 
-    # Déduplication, garde l'ordre.
     seen = set()
     out = []
     for e in entries:
@@ -428,8 +427,6 @@ def parse_hours_from_rsc_text(text):
         if key not in seen:
             out.append({"day": key[0], "opens_at": e["opens_at"], "closes_at": e["closes_at"]})
             seen.add(key)
-
-    # Si on a trop de doublons unknown, une plage suffit pour l'appliquer au jour courant.
     return out
 
 
@@ -437,6 +434,9 @@ def clean_admin_cookie(admin_cookie):
     cookie = str(admin_cookie or "").strip().strip('"').strip("'")
     cookie = cookie.replace("^", "")
     cookie = cookie.replace("%^", "%")
+    # Corrige les noms si un underscore a sauté au copier-coller.
+    cookie = cookie.replace(" _Secure-next-auth.", " __Secure-next-auth.")
+    cookie = cookie.replace("; _Secure-next-auth.", "; __Secure-next-auth.")
     cookie = cookie.replace(" Secure-next-auth.", " __Secure-next-auth.")
     cookie = cookie.replace("; Secure-next-auth.", "; __Secure-next-auth.")
     cookie = cookie.replace(" Host-next-auth.", " __Host-next-auth.")
@@ -444,10 +444,21 @@ def clean_admin_cookie(admin_cookie):
     return cookie
 
 
+def make_next_router_state_tree(point_id):
+    # Header observé dans le Copy as cURL : il aide Next/RSC à renvoyer la bonne page working_hours.
+    return (
+        '%5B%22%22%2C%7B%22children%22%3A%5B%5B%22locale%22%2C%22fr%22%2C%22d%22%5D%2C'
+        '%7B%22children%22%3A%5B%22(protected)%22%2C%7B%22children%22%3A%5B%22points%22%2C'
+        f'%7B%22children%22%3A%5B%5B%22id%22%2C%22{int(point_id)}%22%2C%22d%22%5D%2C'
+        '%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2C%22refetch%22%5D%7D%2Cnull%2Cnull%5D%7D%2C'
+        'null%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D'
+    )
+
+
 def fetch_working_hours_for_point(point_id, admin_cookie):
     """
-    Récupère les horaires d'un point VintedGo via la route working_hours.
-    Utilise le _rsc observé : 1z0wy.
+    Récupère les horaires d'un point via working_hours.
+    Essaie d'abord _rsc=1a6v3, qui correspond au dernier cURL fourni, puis fallback.
     """
     admin_cookie = clean_admin_cookie(admin_cookie)
     if not admin_cookie:
@@ -455,23 +466,30 @@ def fetch_working_hours_for_point(point_id, admin_cookie):
 
     pid = int(point_id)
     base_url = f"https://admin.vintedgo.com/fr/points/{pid}?tab=working_hours"
-    urls = [
-        base_url + "&_rsc=1z0wy",
-        base_url,
-    ]
-    headers = {
+
+    base_headers = {
         "accept": "*/*",
-        "accept-language": "fr,fr-FR;q=0.9,en;q=0.8",
+        "accept-language": "fr,fr-FR;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
         "cookie": admin_cookie,
         "referer": base_url,
         "rsc": "1",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
         "user-agent": "Mozilla/5.0",
+        "next-router-state-tree": make_next_router_state_tree(pid),
     }
+
+    attempts = [
+        (base_url + "&_rsc=1a6v3", base_headers),
+        (base_url + "&_rsc=1z0wy", base_headers),
+        (base_url, {k: v for k, v in base_headers.items() if k not in ["rsc", "next-router-state-tree"]}),
+    ]
 
     last_text = ""
     last_status = ""
-    for url in urls:
-        r = requests.get(url, headers=headers, timeout=10)
+    for url, headers_ in attempts:
+        r = requests.get(url, headers=headers_, timeout=12)
         last_status = r.status_code
         last_text = r.text or ""
 
@@ -488,7 +506,7 @@ def fetch_working_hours_for_point(point_id, admin_cookie):
     try:
         debug_dir = DATA_DIR / "debug_hours"
         debug_dir.mkdir(exist_ok=True)
-        (debug_dir / f"point_{pid}_status_{last_status}.txt").write_text(last_text[:10000], encoding="utf-8")
+        (debug_dir / f"point_{pid}_status_{last_status}.txt").write_text(last_text[:20000], encoding="utf-8")
     except Exception:
         pass
 
@@ -654,7 +672,7 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
     ok_count = int((df["hours_source"] == "admin_ok").sum())
     empty_count = int((df["hours_source"] == "admin_empty_debug_saved").sum())
     error_count = int(df["hours_source"].astype(str).str.startswith("error:").sum())
-    st.caption(f"Horaires : {ok_count} OK, {empty_count} vides/debug, {error_count} erreurs, sur {len(df)} points.")
+    st.caption(f"Horaires : {ok_count} OK, {empty_count} vides/debug, {error_count} erreurs, sur {len(df)} points. Si beaucoup de vides, le debug est dans data/debug_hours.")
     return df
 
 
