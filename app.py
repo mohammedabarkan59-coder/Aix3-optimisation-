@@ -604,14 +604,23 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
         if col not in cache.columns:
             cache[col] = None
 
-    existing = set(cache["point_id"].astype(str).tolist()) if not cache.empty else set()
+    # Cache valable seulement si les horaires ont été récupérés correctement
+    # ou si c'est un locker mis en 24/24 par défaut.
+    valid_cache = set()
+    if not cache.empty:
+        tmp_cache = cache.copy()
+        tmp_cache["point_id_str"] = tmp_cache["point_id"].astype(str)
+        valid_sources = {"admin_ok", "locker_default"}
+        valid_cache = set(tmp_cache.loc[tmp_cache["hours_source"].isin(valid_sources), "point_id_str"].tolist())
+
     rows_to_fetch = []
     for row in df.itertuples(index=False):
         point_id = getattr(row, "point_id", None)
         if pd.isna(point_id):
             continue
         pid = str(int(point_id)) if str(point_id).replace(".0", "").isdigit() else str(point_id)
-        if force_refresh or pid not in existing:
+        # On retente automatiquement les points précédemment en admin_empty_debug_saved ou error.
+        if force_refresh or pid not in valid_cache:
             rows_to_fetch.append(row)
 
     progress = st.progress(0, text=f"Récupération horaires : 0/{len(rows_to_fetch)}") if rows_to_fetch else None
@@ -1326,6 +1335,7 @@ with st.sidebar:
     heure_depart_obj = st.time_input("Heure de départ", value=time(8, 0))
     heure_depart = heure_depart_obj.strftime("%H:%M")
     force_hours_refresh = st.checkbox("Forcer la mise à jour des horaires", value=False)
+    clear_hours_cache = st.checkbox("Vider le cache horaires avant récupération", value=False)
 
     manual_batch = st.text_input("Batch ID manuel (optionnel)", value="")
 
@@ -1390,11 +1400,19 @@ if hours_btn:
             raise RuntimeError("VINTED_ADMIN_COOKIE manquant dans les secrets Streamlit.")
 
         with st.spinner("Récupération de tous les horaires du batch..."):
+            if clear_hours_cache:
+                cache_file = DATA_DIR / f"working_hours_cache_{selected_center}.csv"
+                cache_xlsx = DATA_DIR / f"working_hours_cache_{selected_center}.xlsx"
+                if cache_file.exists():
+                    cache_file.unlink()
+                if cache_xlsx.exists():
+                    cache_xlsx.unlink()
+
             st.session_state.df = enrich_points_with_hours(
                 st.session_state.df,
                 selected_center,
                 ADMIN_COOKIE,
-                force_refresh=force_hours_refresh,
+                force_refresh=force_hours_refresh or clear_hours_cache,
             )
             st.session_state.opt = None
             st.session_state.summary = None
