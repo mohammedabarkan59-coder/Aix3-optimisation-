@@ -3,6 +3,7 @@ import os
 import json
 import math
 import hmac
+import html
 import re
 from datetime import time
 from pathlib import Path
@@ -379,54 +380,99 @@ def intervals_have_lunch_break(intervals):
     return not open_at_lunch and bool(mins)
 
 
+def strip_html_for_hours(text):
+    """
+    Transforme une page HTML/RSC en texte lisible :
+    - enlève scripts/styles ;
+    - enlève les tags ;
+    - décode les entités HTML ;
+    - normalise les espaces.
+    """
+    if not text:
+        return ""
+    s = html.unescape(str(text))
+    s = re.sub(r"<script\b[^>]*>.*?</script>", " ", s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r"<style\b[^>]*>.*?</style>", " ", s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = s.replace("\\u003c", "<").replace("\\u003e", ">").replace("\\u0022", '"')
+    s = s.replace('\\"', '"')
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
 def parse_hours_from_rsc_text(text):
     """
     Extrait les horaires depuis une réponse RSC/HTML VintedGo.
-    Gère JSON normal, RSC échappé, clés camelCase/snake_case, et libellés visuels.
+    Gère :
+    - JSON normal : opens_at / closes_at ;
+    - RSC échappé ;
+    - HTML rendu serveur où les horaires sont dans le texte avec des tags entre 06:30 et 19:30.
     """
     if not text:
         return []
 
     versions = [
-        text,
-        text.replace('\\"', '"').replace("\\\\", "\\"),
-        text.replace("\\u0022", '"'),
-        text.replace("&quot;", '"'),
+        str(text),
+        str(text).replace('\\"', '"').replace("\\\\", "\\"),
+        str(text).replace("\\u0022", '"'),
+        strip_html_for_hours(text),
     ]
 
     entries = []
     time_re = r'([0-2]\d:[0-5]\d)'
+    days_re = r'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday)'
 
     for raw in versions:
-        # Champs horaires avec ou sans guillemets autour des clés.
+        # JSON/RSC : clés horaires.
         patterns = [
-            rf'["\']?opens_at["\']?\s*:\s*["\']{time_re}["\'].{{0,260}}?["\']?closes_at["\']?\s*:\s*["\']{time_re}["\']',
-            rf'["\']?opensAt["\']?\s*:\s*["\']{time_re}["\'].{{0,260}}?["\']?closesAt["\']?\s*:\s*["\']{time_re}["\']',
-            rf'["\']?(?:opening_time|open_time|starts_at|start_at)["\']?\s*:\s*["\']{time_re}["\'].{{0,260}}?["\']?(?:closing_time|close_time|ends_at|end_at)["\']?\s*:\s*["\']{time_re}["\']',
+            rf'["\']?opens_at["\']?\s*:\s*["\']{time_re}["\'].{{0,300}}?["\']?closes_at["\']?\s*:\s*["\']{time_re}["\']',
+            rf'["\']?opensAt["\']?\s*:\s*["\']{time_re}["\'].{{0,300}}?["\']?closesAt["\']?\s*:\s*["\']{time_re}["\']',
+            rf'["\']?(?:opening_time|open_time|starts_at|start_at)["\']?\s*:\s*["\']{time_re}["\'].{{0,300}}?["\']?(?:closing_time|close_time|ends_at|end_at)["\']?\s*:\s*["\']{time_re}["\']',
         ]
         for pat in patterns:
             for open_at, close_at in re.findall(pat, raw, flags=re.IGNORECASE | re.DOTALL):
                 entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
 
-        # Jour + libellé.
+        # Texte : jour ... 06:30 - 19:30, même avec beaucoup d'espaces.
         pday = re.compile(
-            rf'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday).{{0,500}}?{time_re}\s*-\s*{time_re}',
+            rf'{days_re}.{{0,650}}?{time_re}\s*(?:-|–|—|à|to)\s*{time_re}',
             re.IGNORECASE | re.DOTALL,
         )
         for day, open_at, close_at in pday.findall(raw):
             entries.append({"day": str(day).lower(), "opens_at": open_at, "closes_at": close_at})
 
-        # Fallback tous les HH:MM - HH:MM.
-        for open_at, close_at in re.findall(rf'{time_re}\s*-\s*{time_re}', raw):
+        # Fallback : toutes les plages HH:MM - HH:MM.
+        for open_at, close_at in re.findall(rf'{time_re}\s*(?:-|–|—|à|to)\s*{time_re}', raw, flags=re.IGNORECASE):
             entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
+
+    # Nettoyage : on enlève les horaires impossibles/inutiles.
+    clean = []
+    for e in entries:
+        o, c = e.get("opens_at"), e.get("closes_at")
+        if not o or not c or o == c:
+            continue
+        clean.append(e)
 
     seen = set()
     out = []
-    for e in entries:
+    for e in clean:
         key = (str(e["day"]).lower(), e["opens_at"], e["closes_at"])
         if key not in seen:
             out.append({"day": key[0], "opens_at": e["opens_at"], "closes_at": e["closes_at"]})
             seen.add(key)
+
+    # S'il y a beaucoup de doublons unknown, garder une seule plage suffit.
+    # Mais si les jours sont identifiés, on les conserve.
+    if out and all(e["day"] == "unknown" for e in out):
+        uniq = []
+        seen2 = set()
+        for e in out:
+            k = (e["opens_at"], e["closes_at"])
+            if k not in seen2:
+                uniq.append(e)
+                seen2.add(k)
+        return uniq
+
     return out
 
 
@@ -1472,7 +1518,18 @@ if df is not None and not df.empty:
                 try:
                     status, url, raw_text = fetch_working_hours_response(diag_pid, ADMIN_COOKIE)
                     intervals = parse_hours_from_rsc_text(raw_text)
-                    st.write({"status": status, "url": url, "intervals_found": intervals[:10], "raw_length": len(raw_text or "")})
+                    stripped = strip_html_for_hours(raw_text or "")
+                    st.write({
+                        "status": status,
+                        "url": url,
+                        "intervals_found": intervals[:10],
+                        "raw_length": len(raw_text or ""),
+                        "contains_heures": "Heures" in (raw_text or "") or "heures" in (raw_text or "").lower(),
+                        "contains_opens_at": "opens_at" in (raw_text or "") or "opensAt" in (raw_text or ""),
+                    })
+                    st.caption("Texte HTML nettoyé — extrait")
+                    st.code(stripped[:2500])
+                    st.caption("Réponse brute — extrait")
                     st.code((raw_text or "")[:2500])
                 except Exception as e:
                     st.error(str(e))
