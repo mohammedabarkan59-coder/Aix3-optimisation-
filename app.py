@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
+TOKEN_STORE_PATH = DATA_DIR / "runtime_vinted_token.json"
 load_dotenv(BASE_DIR / ".env")
 
 
@@ -33,6 +34,48 @@ def get_secret(name, default=""):
     except Exception:
         pass
     return str(os.getenv(name, default))
+
+
+def clean_bearer_token(value):
+    """Nettoie un token collé depuis F12/cURL : enlève Bearer, quotes, ^ et espaces."""
+    token = str(value or "").strip().strip('"').strip("'")
+    token = token.replace("^", "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
+
+
+def read_runtime_token():
+    """Lit le token mis à jour depuis l'espace admin de l'application."""
+    try:
+        if TOKEN_STORE_PATH.exists():
+            data = json.loads(TOKEN_STORE_PATH.read_text(encoding="utf-8"))
+            token = clean_bearer_token(data.get("token", ""))
+            if token:
+                return token
+    except Exception:
+        pass
+    return ""
+
+
+def write_runtime_token(token, username=""):
+    """Sauvegarde le token pour tous les comptes de l'application."""
+    token = clean_bearer_token(token)
+    if not token:
+        raise RuntimeError("Token vide.")
+    payload = {
+        "token": token,
+        "updated_by": username,
+        "updated_at": pd.Timestamp.now().isoformat(),
+    }
+    TOKEN_STORE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return token
+
+
+def get_active_vinted_token():
+    """Priorité au token mis à jour dans l'app, sinon secret Streamlit."""
+    runtime = read_runtime_token()
+    return runtime if runtime else clean_bearer_token(get_secret("VINTED_TOKEN", ""))
 
 
 def get_nested_secret(section, key, default=""):
@@ -98,7 +141,8 @@ CENTERS = {
     },
 }
 
-TOKEN = get_secret("VINTED_TOKEN", "")
+TOKEN = get_active_vinted_token()
+ADMIN_COOKIE = get_secret("VINTED_ADMIN_COOKIE", "")
 
 AVG_SPEED = 50
 ROAD_FACTOR = 1.15
@@ -157,7 +201,7 @@ def detect_latest_batch(token, sorting_center_id, center_code):
     url = f"https://carrier.vintedgo.com/drivers/point_visits_batches?limit=10&sorting_center_id={sorting_center_id}"
     r = requests.get(url, headers=headers(token), timeout=40)
     if r.status_code == 401:
-        raise RuntimeError("Token VintedGo expiré ou incorrect. Mets un token frais dans les secrets.")
+        raise RuntimeError("Token VintedGo expiré ou incorrect. Connecte-toi avec le compte mohammed et mets à jour le token dans l’espace Admin.")
     r.raise_for_status()
     data = r.json()
 
@@ -206,7 +250,7 @@ def fetch_points(token, batch_id, center_code):
     url = f"https://carrier.vintedgo.com/drivers/point_visits_batches/{batch_id}/route_editor_data"
     r = requests.get(url, headers=headers(token), timeout=40)
     if r.status_code == 401:
-        raise RuntimeError("Token VintedGo expiré ou incorrect. Mets un token frais dans les secrets.")
+        raise RuntimeError("Token VintedGo expiré ou incorrect. Connecte-toi avec le compte mohammed et mets à jour le token dans l’espace Admin.")
     r.raise_for_status()
     data = r.json()
 
@@ -337,69 +381,118 @@ def intervals_have_lunch_break(intervals):
 
 def parse_hours_from_rsc_text(text):
     """
-    Extrait les horaires depuis la réponse RSC Next.js.
-    On cherche les champs opens_at / closes_at observés dans le cURL.
+    Extrait les horaires depuis la réponse RSC/HTML VintedGo.
+    Cherche les champs opens_at / closes_at ou les libellés visuels 06:30 - 19:30.
     """
     if not text:
         return []
 
-    # Exemple observé : "opens_at":"07:30","closes_at":"20:00"
-    # On capture éventuellement day/name autour.
+    versions = [
+        text,
+        text.replace('\\"', '"').replace("\\\\", "\\"),
+        text.replace("\\u0022", '"'),
+        text.replace("&quot;", '"'),
+    ]
+
     entries = []
+    time_re = r'([0-2]\d:[0-5]\d)'
 
-    # Pattern avec un day avant opens/closes
-    pattern_day = re.compile(
-        r'"(?:day|weekday|day_name|name)"\s*:\s*"([^"]+)".{0,250}?"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,80}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
-        re.IGNORECASE | re.DOTALL,
-    )
-    for day, open_at, close_at in pattern_day.findall(text):
-        entries.append({"day": day.lower(), "opens_at": open_at, "closes_at": close_at})
+    for raw in versions:
+        patterns = [
+            rf'"opens_at"\s*:\s*"{time_re}".{{0,220}}?"closes_at"\s*:\s*"{time_re}"',
+            rf'"opensAt"\s*:\s*"{time_re}".{{0,220}}?"closesAt"\s*:\s*"{time_re}"',
+            rf'"(?:opening_time|open_time|starts_at|start_at)"\s*:\s*"{time_re}".{{0,220}}?"(?:closing_time|close_time|ends_at|end_at)"\s*:\s*"{time_re}"',
+        ]
+        for pat in patterns:
+            for open_at, close_at in re.findall(pat, raw, flags=re.IGNORECASE | re.DOTALL):
+                entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
 
-    if entries:
-        return entries
+        # Si le jour est visible près des horaires.
+        pday = re.compile(
+            rf'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday).{{0,260}}?{time_re}\s*-\s*{time_re}',
+            re.IGNORECASE | re.DOTALL,
+        )
+        for day, open_at, close_at in pday.findall(raw):
+            entries.append({"day": str(day).lower(), "opens_at": open_at, "closes_at": close_at})
 
-    # Fallback sans jour : on récupère toutes les paires horaires.
-    pattern_simple = re.compile(
-        r'"opens_at"\s*:\s*"([0-2]\d:[0-5]\d)".{0,80}?"closes_at"\s*:\s*"([0-2]\d:[0-5]\d)"',
-        re.IGNORECASE | re.DOTALL,
-    )
-    for open_at, close_at in pattern_simple.findall(text):
-        entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
+    # Fallback général : extrait tous les libellés HH:MM - HH:MM.
+    if not entries:
+        for open_at, close_at in re.findall(rf'{time_re}\s*-\s*{time_re}', text):
+            entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
 
-    # Déduplication
+    # Déduplication, garde l'ordre.
     seen = set()
     out = []
     for e in entries:
-        key = (e["day"], e["opens_at"], e["closes_at"])
+        key = (str(e["day"]).lower(), e["opens_at"], e["closes_at"])
         if key not in seen:
-            out.append(e)
+            out.append({"day": key[0], "opens_at": e["opens_at"], "closes_at": e["closes_at"]})
             seen.add(key)
+
+    # Si on a trop de doublons unknown, une plage suffit pour l'appliquer au jour courant.
     return out
+
+
+def clean_admin_cookie(admin_cookie):
+    cookie = str(admin_cookie or "").strip().strip('"').strip("'")
+    cookie = cookie.replace("^", "")
+    cookie = cookie.replace("%^", "%")
+    cookie = cookie.replace(" Secure-next-auth.", " __Secure-next-auth.")
+    cookie = cookie.replace("; Secure-next-auth.", "; __Secure-next-auth.")
+    cookie = cookie.replace(" Host-next-auth.", " __Host-next-auth.")
+    cookie = cookie.replace("; Host-next-auth.", "; __Host-next-auth.")
+    return cookie
 
 
 def fetch_working_hours_for_point(point_id, admin_cookie):
     """
-    Appelle la page admin du point et extrait les horaires.
-    Nécessite VINTED_ADMIN_COOKIE dans les secrets Streamlit.
+    Récupère les horaires d'un point VintedGo via la route working_hours.
+    Utilise le _rsc observé : 1z0wy.
     """
+    admin_cookie = clean_admin_cookie(admin_cookie)
     if not admin_cookie:
         return []
 
-    url = f"https://admin.vintedgo.com/fr/points/{int(point_id)}?tab=working_hours&_rsc=1a6v3"
-    h = {
+    pid = int(point_id)
+    base_url = f"https://admin.vintedgo.com/fr/points/{pid}?tab=working_hours"
+    urls = [
+        base_url + "&_rsc=1z0wy",
+        base_url,
+    ]
+    headers = {
         "accept": "*/*",
         "accept-language": "fr,fr-FR;q=0.9,en;q=0.8",
         "cookie": admin_cookie,
-        "referer": f"https://admin.vintedgo.com/fr/points/{int(point_id)}?tab=working_hours",
+        "referer": base_url,
         "rsc": "1",
         "user-agent": "Mozilla/5.0",
     }
 
-    r = requests.get(url, headers=h, timeout=25)
-    if r.status_code in (401, 403):
-        raise RuntimeError("Cookie admin VintedGo expiré ou non autorisé. Remplace VINTED_ADMIN_COOKIE dans les secrets.")
-    r.raise_for_status()
-    return parse_hours_from_rsc_text(r.text)
+    last_text = ""
+    last_status = ""
+    for url in urls:
+        r = requests.get(url, headers=headers, timeout=10)
+        last_status = r.status_code
+        last_text = r.text or ""
+
+        if r.status_code in (401, 403):
+            raise RuntimeError("Cookie admin VintedGo expiré ou non autorisé. Remplace VINTED_ADMIN_COOKIE dans les secrets.")
+        if r.status_code >= 400:
+            continue
+
+        intervals = parse_hours_from_rsc_text(last_text)
+        if intervals:
+            return intervals
+
+    # Sauvegarde debug si aucun horaire trouvé.
+    try:
+        debug_dir = DATA_DIR / "debug_hours"
+        debug_dir.mkdir(exist_ok=True)
+        (debug_dir / f"point_{pid}_status_{last_status}.txt").write_text(last_text[:10000], encoding="utf-8")
+    except Exception:
+        pass
+
+    return []
 
 
 def choose_intervals_for_day(hours_json, scheduled_for):
@@ -456,6 +549,164 @@ def add_hours_display_columns(df):
     )
     df["pause_midi_detectee"] = df.get("has_lunch_break", False)
     return df
+
+
+
+def is_open_at(row, minute_value):
+    if row.get("type") == "Casier / Locker":
+        return True
+
+    intervals = choose_intervals_for_day(row.get("hours_json", "[]"), row.get("scheduled_for"))
+    if not intervals:
+        return True
+
+    m = int(round(minute_value))
+    for it in intervals:
+        o = time_to_min(it.get("opens_at"))
+        c = time_to_min(it.get("closes_at"))
+        if o is not None and c is not None and o <= m <= c:
+            return True
+    return False
+
+
+def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False):
+    """
+    Boucle propre sur tous les point_id du batch.
+    Remplit le cache data/working_hours_cache_<CENTRE>.csv puis ajoute les colonnes horaires au tableau.
+    """
+    df = df.copy()
+    cache_path = DATA_DIR / f"working_hours_cache_{center_code}.csv"
+
+    if cache_path.exists() and not force_refresh:
+        cache = pd.read_csv(cache_path)
+    else:
+        cache = pd.DataFrame(columns=["point_id", "code", "hours_json", "has_lunch_break", "hours_source"])
+
+    for col in ["point_id", "code", "hours_json", "has_lunch_break", "hours_source"]:
+        if col not in cache.columns:
+            cache[col] = None
+
+    existing = set(cache["point_id"].astype(str).tolist()) if not cache.empty else set()
+    rows_to_fetch = []
+    for row in df.itertuples(index=False):
+        point_id = getattr(row, "point_id", None)
+        if pd.isna(point_id):
+            continue
+        pid = str(int(point_id)) if str(point_id).replace(".0", "").isdigit() else str(point_id)
+        if force_refresh or pid not in existing:
+            rows_to_fetch.append(row)
+
+    progress = st.progress(0, text=f"Récupération horaires : 0/{len(rows_to_fetch)}") if rows_to_fetch else None
+    new_rows = []
+
+    for i, row in enumerate(rows_to_fetch, start=1):
+        point_id = getattr(row, "point_id", None)
+        code = getattr(row, "code", "")
+        point_type = getattr(row, "type", "")
+
+        pid = str(int(point_id)) if str(point_id).replace(".0", "").isdigit() else str(point_id)
+
+        if point_type == "Casier / Locker":
+            intervals = [{"day": "unknown", "opens_at": "00:00", "closes_at": "23:59"}]
+            source = "locker_default"
+        else:
+            try:
+                intervals = fetch_working_hours_for_point(point_id, admin_cookie)
+                source = "admin_ok" if intervals else "admin_empty_debug_saved"
+            except Exception as e:
+                intervals = []
+                source = f"error: {str(e)[:120]}"
+
+        new_rows.append({
+            "point_id": pid,
+            "code": code,
+            "hours_json": json.dumps(intervals, ensure_ascii=False),
+            "has_lunch_break": bool(intervals_have_lunch_break(intervals)),
+            "hours_source": source,
+        })
+
+        if progress:
+            progress.progress(i / len(rows_to_fetch), text=f"Récupération horaires : {i}/{len(rows_to_fetch)}")
+
+    if progress:
+        progress.empty()
+
+    if new_rows:
+        cache = pd.concat([cache, pd.DataFrame(new_rows)], ignore_index=True)
+        cache = cache.drop_duplicates(subset=["point_id"], keep="last")
+        cache.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        cache.to_excel(DATA_DIR / f"working_hours_cache_{center_code}.xlsx", index=False)
+
+    # Merge robuste
+    for col in ["hours_json", "has_lunch_break", "hours_source", "horaires_ouverture", "pause_midi_detectee"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+
+    df["_pid"] = df["point_id"].apply(lambda x: str(int(x)) if pd.notna(x) and str(x).replace(".0", "").isdigit() else str(x))
+    cache["_pid"] = cache["point_id"].astype(str)
+    df = df.merge(cache[["_pid", "hours_json", "has_lunch_break", "hours_source"]], on="_pid", how="left")
+    df = df.drop(columns=["_pid"], errors="ignore")
+    df["hours_json"] = df["hours_json"].fillna("[]")
+    df["has_lunch_break"] = df["has_lunch_break"].fillna(False).astype(bool)
+    df["hours_source"] = df["hours_source"].fillna("missing")
+    df = add_hours_display_columns(df)
+
+    ok_count = int((df["hours_source"] == "admin_ok").sum())
+    empty_count = int((df["hours_source"] == "admin_empty_debug_saved").sum())
+    error_count = int(df["hours_source"].astype(str).str.startswith("error:").sum())
+    st.caption(f"Horaires : {ok_count} OK, {empty_count} vides/debug, {error_count} erreurs, sur {len(df)} points.")
+    return df
+
+
+def route_order_with_hours(df_route, depot_lat, depot_lon, start_minute):
+    """
+    Ordre glouton horaires + distance :
+    - évite les passages estimés sur un point fermé ;
+    - priorise les points avec pause midi avant 12h ou après 14h ;
+    - départage par distance.
+    """
+    remaining = list(df_route.index)
+    order = []
+    eta_by_idx = {}
+    status_by_idx = {}
+    cur_lat, cur_lon = depot_lat, depot_lon
+    current_min = int(start_minute)
+
+    while remaining:
+        candidates = []
+        for i in remaining:
+            row = df_route.loc[i]
+            dist = hav(cur_lat, cur_lon, row["lat"], row["lon"]) * ROAD_FACTOR
+            travel_min = dist / AVG_SPEED * 60
+            arrival = current_min + travel_min
+
+            open_ok = is_open_at(row, arrival)
+            lunch_sensitive = bool(row.get("has_lunch_break", False)) and row.get("type") != "Casier / Locker"
+
+            penalty = 0
+            if not open_ok:
+                penalty += 10000
+            if lunch_sensitive:
+                if current_min < 12 * 60 and arrival <= 12 * 60:
+                    penalty -= 200
+                elif 12 * 60 <= arrival <= 14 * 60:
+                    penalty += 5000
+                elif current_min < 12 * 60 and arrival > 12 * 60:
+                    penalty += 500
+
+            candidates.append((penalty + dist, i, arrival, open_ok))
+
+        _, chosen, arrival, open_ok = min(candidates, key=lambda x: x[0])
+        order.append(chosen)
+        eta_by_idx[chosen] = arrival
+        status_by_idx[chosen] = "ouvert" if open_ok else "fermé_estime"
+
+        service = float(df_route.loc[chosen, "service"])
+        current_min = int(round(arrival + service))
+        cur_lat, cur_lon = df_route.loc[chosen, "lat"], df_route.loc[chosen, "lon"]
+        remaining.remove(chosen)
+
+    return order, eta_by_idx, status_by_idx
 
 
 def estimate_max_route_duration_for_k(df, k, depot_lat, depot_lon):
@@ -988,7 +1239,7 @@ renderSelectors();renderMarkers();if(POINTS.length)map.fitBounds(POINTS.map(p=>[
 # =========================
 
 st.set_page_config(page_title="VintedGo Multi-centres", layout="wide")
-st.title("VintedGo — optimisation distance multi-centres")
+st.title("VintedGo — optimisation manager multi-centres")
 
 allowed_centers = [c for c in st.session_state.allowed_centers if c in CENTERS]
 if not allowed_centers:
@@ -997,6 +1248,29 @@ if not allowed_centers:
 
 with st.sidebar:
     st.success(f"Connecté : {st.session_state.username}")
+
+    if st.session_state.username == "mohammed":
+        with st.expander("🔐 Admin — Token VintedGo", expanded=False):
+            token_status = "token app actif" if read_runtime_token() else "token des Secrets"
+            st.caption(f"Source actuelle : {token_status}")
+            new_token = st.text_area(
+                "Nouveau VINTED_TOKEN",
+                value="",
+                height=110,
+                placeholder="Colle ici le token sans Bearer, ou avec Bearer si tu l’as copié depuis F12."
+            )
+            if st.button("Sauvegarder le token pour tous les comptes"):
+                try:
+                    saved = write_runtime_token(new_token, st.session_state.username)
+                    st.success("Token mis à jour pour mohammed, kevin et lil3.")
+                    st.session_state.df = None
+                    st.session_state.opt = None
+                    st.session_state.summary = None
+                    st.session_state.batches_df = None
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
     if st.button("Se déconnecter"):
         for k in ["authenticated", "username", "allowed_centers", "df", "opt", "summary", "batches_df"]:
             st.session_state.pop(k, None)
@@ -1025,13 +1299,24 @@ with st.sidebar:
         help="Décoche l’option automatique si tu veux forcer ce nombre."
     )
 
+    mode_optimisation = st.radio(
+        "Mode d’optimisation",
+        ["Distance uniquement", "Horaires d'ouverture + distance"],
+        index=0,
+        help="Le mode horaires utilise le cache horaires récupéré via le bouton dédié."
+    )
+    heure_depart_obj = st.time_input("Heure de départ", value=time(8, 0))
+    heure_depart = heure_depart_obj.strftime("%H:%M")
+    force_hours_refresh = st.checkbox("Forcer la mise à jour des horaires", value=False)
+
     manual_batch = st.text_input("Batch ID manuel (optionnel)", value="")
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 auto = col1.button("Actualiser dernière tournée", type="primary")
 manual = col2.button("Synchroniser Batch ID")
 load = col3.button("Charger fichier local")
-opt_btn = col4.button("Optimiser équilibré")
+hours_btn = col4.button("Récupérer horaires")
+opt_btn = col5.button("Optimiser équilibré")
 
 for key in ["df", "opt", "summary", "batches_df"]:
     if key not in st.session_state:
@@ -1040,7 +1325,7 @@ for key in ["df", "opt", "summary", "batches_df"]:
 if auto:
     try:
         if not TOKEN:
-            raise RuntimeError("VINTED_TOKEN manquant dans les secrets.")
+            raise RuntimeError("VINTED_TOKEN manquant. Connecte-toi avec le compte mohammed et ajoute le token dans l’espace Admin.")
         with st.spinner(f"Détection du dernier batch {selected_center}..."):
             latest_id, batches_df = detect_latest_batch(TOKEN, cfg["sorting_center_id"], selected_center)
             st.session_state.batches_df = batches_df
@@ -1057,7 +1342,7 @@ if auto:
 if manual:
     try:
         if not TOKEN:
-            raise RuntimeError("VINTED_TOKEN manquant dans les secrets.")
+            raise RuntimeError("VINTED_TOKEN manquant. Connecte-toi avec le compte mohammed et ajoute le token dans l’espace Admin.")
         if not manual_batch:
             raise RuntimeError("Indique un Batch ID manuel.")
         with st.spinner(f"Scraping {selected_center} batch {manual_batch}..."):
@@ -1078,6 +1363,27 @@ if load:
     else:
         st.error("Aucun fichier local trouvé pour ce centre.")
 
+
+if hours_btn:
+    try:
+        if st.session_state.df is None or st.session_state.df.empty:
+            raise RuntimeError("Récupère d’abord les points VintedGo.")
+        if not ADMIN_COOKIE:
+            raise RuntimeError("VINTED_ADMIN_COOKIE manquant dans les secrets Streamlit.")
+
+        with st.spinner("Récupération de tous les horaires du batch..."):
+            st.session_state.df = enrich_points_with_hours(
+                st.session_state.df,
+                selected_center,
+                ADMIN_COOKIE,
+                force_refresh=force_hours_refresh,
+            )
+            st.session_state.opt = None
+            st.session_state.summary = None
+        st.success("Horaires récupérés. Tu peux optimiser en mode horaires.")
+    except Exception as e:
+        st.error(str(e))
+
 if st.session_state.batches_df is not None:
     st.subheader("Batchs détectés")
     st.dataframe(st.session_state.batches_df, use_container_width=True, height=180)
@@ -1097,10 +1403,14 @@ if df is not None and not df.empty:
         display_df = add_hours_display_columns(display_df)
     preferred_cols = [
         "code", "type", "nom", "adresse", "ville", "code_postal",
+        "horaires_ouverture", "pause_midi_detectee", "hours_source",
         "lat", "lon", "maps"
     ]
     cols = [c for c in preferred_cols if c in display_df.columns] + [c for c in display_df.columns if c not in preferred_cols]
     st.dataframe(display_df[cols], use_container_width=True, height=260)
+    if "hours_source" in display_df.columns:
+        st.caption("Diagnostic horaires")
+        st.write(display_df["hours_source"].value_counts())
 
     if opt_btn:
         try:
@@ -1123,19 +1433,28 @@ if df is not None and not df.empty:
                 else:
                     selected_k = int(nb_tournees)
 
-            with st.spinner("Optimisation distance équilibrée..."):
+            if mode_optimisation == "Horaires d'ouverture + distance":
+                if "hours_json" not in df_for_opt.columns:
+                    st.warning("Horaires non chargés : clique d’abord sur « Récupérer horaires ». Optimisation lancée en distance uniquement.")
+                    mode_used = "Distance uniquement"
+                else:
+                    mode_used = mode_optimisation
+            else:
+                mode_used = "Distance uniquement"
+
+            with st.spinner(f"Optimisation équilibrée — {mode_used}..."):
                 opt, summary = optimise_balanced(
                     df_for_opt,
                     selected_k,
                     selected_center,
                     depot_lat,
                     depot_lon,
-                    mode_optimisation="Distance uniquement",
-                    heure_depart="08:00",
+                    mode_optimisation=mode_used,
+                    heure_depart=heure_depart,
                 )
                 st.session_state.opt = opt
                 st.session_state.summary = summary
-            st.success(f"Optimisation terminée — distance uniquement — {selected_k} tournées.")
+            st.success(f"Optimisation terminée — {mode_used} — {selected_k} tournées.")
         except Exception as e:
             st.error(str(e))
 
@@ -1158,4 +1477,4 @@ if st.session_state.opt is not None and not st.session_state.opt.empty:
 
     components.html(html, height=720, scrolling=False)
 else:
-    st.info("Choisis un centre, actualise la dernière tournée, puis clique sur Optimiser équilibré. Version manager : optimisation distance uniquement.")
+    st.info("Choisis un centre, actualise la dernière tournée, puis clique sur Optimiser équilibré. Version manager : distance ou horaires d’ouverture + distance.")
