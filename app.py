@@ -3,7 +3,7 @@ import os
 import json
 import math
 import hmac
-import html
+import unicodedata
 import re
 from datetime import time
 from pathlib import Path
@@ -176,6 +176,28 @@ def login_screen():
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
+
+
+def apply_service_times(df, locker_min=15, relais_min=5):
+    """
+    Applique les temps de service choisis dans la sidebar.
+    Les casiers/lockers prennent locker_min, les points relais prennent relais_min.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "type" in out.columns:
+        out["service"] = out["type"].apply(
+            lambda t: float(locker_min) if str(t) == "Casier / Locker" else float(relais_min)
+        )
+    elif "point_type" in out.columns:
+        out["service"] = out["point_type"].apply(
+            lambda t: float(locker_min) if str(t).lower() == "locker" else float(relais_min)
+        )
+    else:
+        out["service"] = float(relais_min)
+    return out
+
 
 if not st.session_state.authenticated:
     login_screen()
@@ -380,99 +402,57 @@ def intervals_have_lunch_break(intervals):
     return not open_at_lunch and bool(mins)
 
 
-def strip_html_for_hours(text):
-    """
-    Transforme une page HTML/RSC en texte lisible :
-    - enlève scripts/styles ;
-    - enlève les tags ;
-    - décode les entités HTML ;
-    - normalise les espaces.
-    """
-    if not text:
-        return ""
-    s = html.unescape(str(text))
-    s = re.sub(r"<script\b[^>]*>.*?</script>", " ", s, flags=re.IGNORECASE | re.DOTALL)
-    s = re.sub(r"<style\b[^>]*>.*?</style>", " ", s, flags=re.IGNORECASE | re.DOTALL)
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = s.replace("\\u003c", "<").replace("\\u003e", ">").replace("\\u0022", '"')
-    s = s.replace('\\"', '"')
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
-
-
 def parse_hours_from_rsc_text(text):
     """
-    Extrait les horaires depuis une réponse RSC/HTML VintedGo.
-    Gère :
-    - JSON normal : opens_at / closes_at ;
-    - RSC échappé ;
-    - HTML rendu serveur où les horaires sont dans le texte avec des tags entre 06:30 et 19:30.
+    Extrait les horaires depuis la réponse RSC/HTML VintedGo.
+    Cherche les champs opens_at / closes_at ou les libellés visuels 06:30 - 19:30.
     """
     if not text:
         return []
 
     versions = [
-        str(text),
-        str(text).replace('\\"', '"').replace("\\\\", "\\"),
-        str(text).replace("\\u0022", '"'),
-        strip_html_for_hours(text),
+        text,
+        text.replace('\\"', '"').replace("\\\\", "\\"),
+        text.replace("\\u0022", '"'),
+        text.replace("&quot;", '"'),
     ]
 
     entries = []
     time_re = r'([0-2]\d:[0-5]\d)'
-    days_re = r'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday)'
 
     for raw in versions:
-        # JSON/RSC : clés horaires.
         patterns = [
-            rf'["\']?opens_at["\']?\s*:\s*["\']{time_re}["\'].{{0,300}}?["\']?closes_at["\']?\s*:\s*["\']{time_re}["\']',
-            rf'["\']?opensAt["\']?\s*:\s*["\']{time_re}["\'].{{0,300}}?["\']?closesAt["\']?\s*:\s*["\']{time_re}["\']',
-            rf'["\']?(?:opening_time|open_time|starts_at|start_at)["\']?\s*:\s*["\']{time_re}["\'].{{0,300}}?["\']?(?:closing_time|close_time|ends_at|end_at)["\']?\s*:\s*["\']{time_re}["\']',
+            rf'"opens_at"\s*:\s*"{time_re}".{{0,220}}?"closes_at"\s*:\s*"{time_re}"',
+            rf'"opensAt"\s*:\s*"{time_re}".{{0,220}}?"closesAt"\s*:\s*"{time_re}"',
+            rf'"(?:opening_time|open_time|starts_at|start_at)"\s*:\s*"{time_re}".{{0,220}}?"(?:closing_time|close_time|ends_at|end_at)"\s*:\s*"{time_re}"',
         ]
         for pat in patterns:
             for open_at, close_at in re.findall(pat, raw, flags=re.IGNORECASE | re.DOTALL):
                 entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
 
-        # Texte : jour ... 06:30 - 19:30, même avec beaucoup d'espaces.
+        # Si le jour est visible près des horaires.
         pday = re.compile(
-            rf'{days_re}.{{0,650}}?{time_re}\s*(?:-|–|—|à|to)\s*{time_re}',
+            rf'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday).{{0,260}}?{time_re}\s*-\s*{time_re}',
             re.IGNORECASE | re.DOTALL,
         )
         for day, open_at, close_at in pday.findall(raw):
             entries.append({"day": str(day).lower(), "opens_at": open_at, "closes_at": close_at})
 
-        # Fallback : toutes les plages HH:MM - HH:MM.
-        for open_at, close_at in re.findall(rf'{time_re}\s*(?:-|–|—|à|to)\s*{time_re}', raw, flags=re.IGNORECASE):
+    # Fallback général : extrait tous les libellés HH:MM - HH:MM.
+    if not entries:
+        for open_at, close_at in re.findall(rf'{time_re}\s*-\s*{time_re}', text):
             entries.append({"day": "unknown", "opens_at": open_at, "closes_at": close_at})
 
-    # Nettoyage : on enlève les horaires impossibles/inutiles.
-    clean = []
-    for e in entries:
-        o, c = e.get("opens_at"), e.get("closes_at")
-        if not o or not c or o == c:
-            continue
-        clean.append(e)
-
+    # Déduplication, garde l'ordre.
     seen = set()
     out = []
-    for e in clean:
+    for e in entries:
         key = (str(e["day"]).lower(), e["opens_at"], e["closes_at"])
         if key not in seen:
             out.append({"day": key[0], "opens_at": e["opens_at"], "closes_at": e["closes_at"]})
             seen.add(key)
 
-    # S'il y a beaucoup de doublons unknown, garder une seule plage suffit.
-    # Mais si les jours sont identifiés, on les conserve.
-    if out and all(e["day"] == "unknown" for e in out):
-        uniq = []
-        seen2 = set()
-        for e in out:
-            k = (e["opens_at"], e["closes_at"])
-            if k not in seen2:
-                uniq.append(e)
-                seen2.add(k)
-        return uniq
-
+    # Si on a trop de doublons unknown, une plage suffit pour l'appliquer au jour courant.
     return out
 
 
@@ -480,8 +460,6 @@ def clean_admin_cookie(admin_cookie):
     cookie = str(admin_cookie or "").strip().strip('"').strip("'")
     cookie = cookie.replace("^", "")
     cookie = cookie.replace("%^", "%")
-    cookie = cookie.replace(" _Secure-next-auth.", " __Secure-next-auth.")
-    cookie = cookie.replace("; _Secure-next-auth.", "; __Secure-next-auth.")
     cookie = cookie.replace(" Secure-next-auth.", " __Secure-next-auth.")
     cookie = cookie.replace("; Secure-next-auth.", "; __Secure-next-auth.")
     cookie = cookie.replace(" Host-next-auth.", " __Host-next-auth.")
@@ -489,84 +467,51 @@ def clean_admin_cookie(admin_cookie):
     return cookie
 
 
-def make_next_router_state_tree(point_id):
-    return (
-        '%5B%22%22%2C%7B%22children%22%3A%5B%5B%22locale%22%2C%22fr%22%2C%22d%22%5D%2C'
-        '%7B%22children%22%3A%5B%22(protected)%22%2C%7B%22children%22%3A%5B%22points%22%2C'
-        f'%7B%22children%22%3A%5B%5B%22id%22%2C%22{int(point_id)}%22%2C%22d%22%5D%2C'
-        '%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2C%22refetch%22%5D%7D%2Cnull%2Cnull%5D%7D%2C'
-        'null%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D'
-    )
-
-
-def fetch_working_hours_response(point_id, admin_cookie):
-    """Retourne status, url, text brut pour diagnostic."""
+def fetch_working_hours_for_point(point_id, admin_cookie):
+    """
+    Récupère les horaires d'un point VintedGo via la route working_hours.
+    Utilise le _rsc observé : 1z0wy.
+    """
     admin_cookie = clean_admin_cookie(admin_cookie)
     if not admin_cookie:
-        return 0, "", ""
+        return []
 
     pid = int(point_id)
-    base_path = f"/fr/points/{pid}?tab=working_hours"
-    base_url = f"https://admin.vintedgo.com{base_path}"
-
-    headers_rsc = {
+    base_url = f"https://admin.vintedgo.com/fr/points/{pid}?tab=working_hours"
+    urls = [
+        base_url + "&_rsc=1z0wy",
+        base_url,
+    ]
+    headers = {
         "accept": "*/*",
-        "accept-language": "fr,fr-FR;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-        "cookie": admin_cookie,
-        "referer": base_url,
-        "rsc": "1",
-        "next-url": base_path,
-        "next-router-state-tree": make_next_router_state_tree(pid),
-        "sec-fetch-site": "same-origin",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-dest": "empty",
-        "user-agent": "Mozilla/5.0",
-    }
-
-    headers_html = {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "fr,fr-FR;q=0.9,en;q=0.8",
         "cookie": admin_cookie,
         "referer": base_url,
+        "rsc": "1",
         "user-agent": "Mozilla/5.0",
     }
 
-    attempts = [
-        (base_url + "&_rsc=1a6v3", headers_rsc),
-        (base_url + "&_rsc=1z0wy", headers_rsc),
-        (base_url, headers_html),
-    ]
+    last_text = ""
+    last_status = ""
+    for url in urls:
+        r = requests.get(url, headers=headers, timeout=10)
+        last_status = r.status_code
+        last_text = r.text or ""
 
-    last = (0, "", "")
-    for url, headers_ in attempts:
-        try:
-            r = requests.get(url, headers=headers_, timeout=12, allow_redirects=False)
-            last = (r.status_code, url, r.text or "")
-            if r.status_code in (200, 204) and (r.text or ""):
-                return last
-        except Exception as e:
-            last = (0, url, str(e))
-    return last
+        if r.status_code in (401, 403):
+            raise RuntimeError("Cookie admin VintedGo expiré ou non autorisé. Remplace VINTED_ADMIN_COOKIE dans les secrets.")
+        if r.status_code >= 400:
+            continue
 
+        intervals = parse_hours_from_rsc_text(last_text)
+        if intervals:
+            return intervals
 
-def fetch_working_hours_for_point(point_id, admin_cookie):
-    status, url, text = fetch_working_hours_response(point_id, admin_cookie)
-
-    if status in (401, 403):
-        raise RuntimeError("Cookie admin VintedGo expiré ou non autorisé. Remplace VINTED_ADMIN_COOKIE dans les secrets.")
-
-    intervals = parse_hours_from_rsc_text(text)
-    if intervals:
-        return intervals
-
+    # Sauvegarde debug si aucun horaire trouvé.
     try:
         debug_dir = DATA_DIR / "debug_hours"
         debug_dir.mkdir(exist_ok=True)
-        safe_status = str(status).replace("/", "_")
-        (debug_dir / f"point_{int(point_id)}_status_{safe_status}.txt").write_text(
-            f"URL={url}\nSTATUS={status}\n\n{text[:20000]}",
-            encoding="utf-8"
-        )
+        (debug_dir / f"point_{pid}_status_{last_status}.txt").write_text(last_text[:10000], encoding="utf-8")
     except Exception:
         pass
 
@@ -647,11 +592,262 @@ def is_open_at(row, minute_value):
     return False
 
 
+
+def normalize_match_value(value):
+    """Normalise nom/adresse/ville pour matcher le fichier horaires Excel LIL3 avec le batch."""
+    if value is None or pd.isna(value):
+        return ""
+    s = str(value).strip().lower()
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def clean_postal_code(value):
+    if value is None or pd.isna(value):
+        return ""
+    s = str(value).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s.zfill(5) if s.isdigit() and len(s) <= 5 else s
+
+
+def parse_excel_interval(value):
+    """Transforme '09:00 - 12:30' en dict opens_at/closes_at."""
+    if value is None or pd.isna(value):
+        return None
+    s = str(value).strip()
+    if not s or "fermé" in s.lower() or "ferme" in s.lower():
+        return None
+    m = re.search(r"([0-2]\d:[0-5]\d)\s*(?:-|–|—|à|to)\s*([0-2]\d:[0-5]\d)", s, flags=re.I)
+    if not m:
+        return None
+    return {"opens_at": m.group(1), "closes_at": m.group(2)}
+
+
+def intervals_display_simple(intervals):
+    if not intervals:
+        return ""
+    parts = []
+    for it in intervals:
+        d = it.get("day", "unknown")
+        label = "" if d == "unknown" else f"{d}: "
+        parts.append(f"{label}{it.get('opens_at')}-{it.get('closes_at')}")
+    return " | ".join(parts)
+
+
+def load_center_hours_excel(center_code):
+    """
+    Lit data/horaires_complet.xlsx.
+    Format attendu :
+    ID, Type, Nom, Adresse, CP, Ville, Lundi, Unnamed: 7, Mardi, Unnamed: 9, ...
+    """
+    center_code = str(center_code).upper()
+    if center_code == "LIL3":
+        xlsx_path = DATA_DIR / "horaires_complet.xlsx"
+    elif center_code == "AIX3":
+        xlsx_path = DATA_DIR / "horaires_points_AIX3_11062026.xlsx"
+    else:
+        return pd.DataFrame()
+
+    if not xlsx_path.exists():
+        return pd.DataFrame()
+
+    raw = pd.read_excel(xlsx_path, sheet_name=0)
+
+    # Supprimer la ligne de sous-en-tête Matin / Après-midi.
+    raw = raw[raw["ID"].notna()].copy()
+
+    day_pairs = [
+        ("lundi", "Lundi", "Unnamed: 7"),
+        ("mardi", "Mardi", "Unnamed: 9"),
+        ("mercredi", "Mercredi", "Unnamed: 11"),
+        ("jeudi", "Jeudi", "Unnamed: 13"),
+        ("vendredi", "Vendredi", "Unnamed: 15"),
+        ("samedi", "Samedi", "Unnamed: 17"),
+        ("dimanche", "Dimanche", "Unnamed: 19"),
+    ]
+
+    rows = []
+    for _, r in raw.iterrows():
+        intervals = []
+        for day, morning_col, afternoon_col in day_pairs:
+            for col in [morning_col, afternoon_col]:
+                if col in raw.columns:
+                    interval = parse_excel_interval(r.get(col))
+                    if interval:
+                        interval["day"] = day
+                        intervals.append(interval)
+
+        nom = r.get("Nom", "")
+        adresse = r.get("Adresse", "")
+        cp = clean_postal_code(r.get("CP", ""))
+        ville = r.get("Ville", "")
+        typ = r.get("Type", "")
+
+        full_key = "||".join([
+            normalize_match_value(nom),
+            normalize_match_value(adresse),
+            cp,
+            normalize_match_value(ville),
+        ])
+        address_key = "||".join([
+            normalize_match_value(adresse),
+            cp,
+            normalize_match_value(ville),
+        ])
+        name_city_key = "||".join([
+            normalize_match_value(nom),
+            cp,
+            normalize_match_value(ville),
+        ])
+
+        rows.append({
+            "admin_point_id": str(int(float(r.get("ID")))) if pd.notna(r.get("ID")) else "",
+            "excel_type": typ,
+            "excel_nom": nom,
+            "excel_adresse": adresse,
+            "excel_cp": cp,
+            "excel_ville": ville,
+            "hours_json": json.dumps(intervals, ensure_ascii=False),
+            "has_lunch_break": bool(intervals_have_lunch_break(intervals)),
+            "full_key": full_key,
+            "address_key": address_key,
+            "name_city_key": name_city_key,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def enrich_points_with_center_excel(df, center_code):
+    """
+    Associe les horaires LIL3 depuis data/horaires_complet.xlsx au batch courant.
+    Matching prioritaire :
+    1) nom + adresse + CP + ville
+    2) adresse + CP + ville
+    3) nom + CP + ville
+    """
+    df = df.copy()
+    hours = load_center_hours_excel(center_code)
+    if hours.empty:
+        st.warning(f"Fichier horaires Excel introuvable ou vide pour {center_code}.")
+        return df
+
+    # Index de matching.
+    by_full = {r["full_key"]: r for _, r in hours.iterrows() if r.get("full_key")}
+    by_addr = {r["address_key"]: r for _, r in hours.iterrows() if r.get("address_key")}
+    by_name_city = {r["name_city_key"]: r for _, r in hours.iterrows() if r.get("name_city_key")}
+
+    new_rows = []
+    matched = 0
+
+    for _, row in df.iterrows():
+        point_type = row.get("type", "")
+        if point_type == "Casier / Locker":
+            intervals = [{"day": "unknown", "opens_at": "00:00", "closes_at": "23:59"}]
+            source = "locker_default"
+            admin_point_id = ""
+            match_method = "locker"
+        else:
+            nom = row.get("nom", "")
+            adresse = row.get("adresse", "")
+            cp = clean_postal_code(row.get("code_postal", ""))
+            ville = row.get("ville", "")
+
+            full_key = "||".join([
+                normalize_match_value(nom),
+                normalize_match_value(adresse),
+                cp,
+                normalize_match_value(ville),
+            ])
+            address_key = "||".join([
+                normalize_match_value(adresse),
+                cp,
+                normalize_match_value(ville),
+            ])
+            name_city_key = "||".join([
+                normalize_match_value(nom),
+                cp,
+                normalize_match_value(ville),
+            ])
+
+            match = None
+            match_method = ""
+            if full_key in by_full:
+                match = by_full[full_key]
+                match_method = "full"
+            elif address_key in by_addr:
+                match = by_addr[address_key]
+                match_method = "address"
+            elif name_city_key in by_name_city:
+                match = by_name_city[name_city_key]
+                match_method = "name_city"
+
+            if match is not None:
+                intervals = json.loads(match["hours_json"]) if isinstance(match["hours_json"], str) else match["hours_json"]
+                source = "excel_ok" if intervals else "excel_empty"
+                admin_point_id = match.get("admin_point_id", "")
+                matched += 1 if intervals else 0
+            else:
+                intervals = []
+                source = "excel_not_matched"
+                admin_point_id = ""
+
+        pid = row.get("point_id", "")
+        pid = str(int(float(pid))) if str(pid).replace(".0", "").isdigit() else str(pid)
+
+        new_rows.append({
+            "point_id": pid,
+            "admin_point_id": admin_point_id,
+            "code": row.get("code", ""),
+            "hours_json": json.dumps(intervals, ensure_ascii=False),
+            "has_lunch_break": bool(intervals_have_lunch_break(intervals)),
+            "hours_source": source,
+            "match_method": match_method,
+        })
+
+    cache = pd.DataFrame(new_rows)
+    cache.to_csv(DATA_DIR / f"working_hours_cache_{center_code}.csv", index=False, encoding="utf-8-sig")
+    try:
+        cache.to_excel(DATA_DIR / f"working_hours_cache_{center_code}.xlsx", index=False)
+    except Exception:
+        pass
+
+    # Merge robuste sur point_id.
+    for col in ["hours_json", "has_lunch_break", "hours_source", "horaires_ouverture", "pause_midi_detectee", "admin_point_id", "match_method"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+
+    df["_pid"] = df["point_id"].apply(lambda x: str(int(float(x))) if pd.notna(x) and str(x).replace(".0", "").isdigit() else str(x))
+    cache["_pid"] = cache["point_id"].astype(str)
+    df = df.merge(cache[["_pid", "admin_point_id", "hours_json", "has_lunch_break", "hours_source", "match_method"]], on="_pid", how="left")
+    df = df.drop(columns=["_pid"], errors="ignore")
+    df["hours_json"] = df["hours_json"].fillna("[]")
+    df["has_lunch_break"] = df["has_lunch_break"].fillna(False).astype(bool)
+    df["hours_source"] = df["hours_source"].fillna("missing")
+    df = add_hours_display_columns(df)
+
+    ok_count = int((df["hours_source"] == "excel_ok").sum())
+    not_matched = int((df["hours_source"] == "excel_not_matched").sum())
+    st.caption(f"Horaires Excel {center_code} : {ok_count} points relais matchés, {not_matched} non matchés, sur {len(df)} points.")
+    return df
+
+
 def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False):
     """
-    Boucle propre sur tous les point_id du batch.
-    Remplit le cache data/working_hours_cache_<CENTRE>.csv puis ajoute les colonnes horaires au tableau.
+    Pour LIL3/AIX3 : utilise d'abord les fichiers Excel locaux d'horaires.
+    Pour les autres centres : conserve la récupération via l'admin VintedGo.
     """
+    center_upper = str(center_code).upper()
+    excel_files = {
+        "LIL3": DATA_DIR / "horaires_complet.xlsx",
+        "AIX3": DATA_DIR / "horaires_points_AIX3_11062026.xlsx",
+    }
+    if center_upper in excel_files and excel_files[center_upper].exists():
+        return enrich_points_with_center_excel(df, center_upper)
+
+    # Fallback historique : scraping admin point par point.
     df = df.copy()
     cache_path = DATA_DIR / f"working_hours_cache_{center_code}.csv"
 
@@ -664,23 +860,14 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
         if col not in cache.columns:
             cache[col] = None
 
-    # Cache valable seulement si les horaires ont été récupérés correctement
-    # ou si c'est un locker mis en 24/24 par défaut.
-    valid_cache = set()
-    if not cache.empty:
-        tmp_cache = cache.copy()
-        tmp_cache["point_id_str"] = tmp_cache["point_id"].astype(str)
-        valid_sources = {"admin_ok", "locker_default"}
-        valid_cache = set(tmp_cache.loc[tmp_cache["hours_source"].isin(valid_sources), "point_id_str"].tolist())
-
+    existing = set(cache["point_id"].astype(str).tolist()) if not cache.empty else set()
     rows_to_fetch = []
     for row in df.itertuples(index=False):
         point_id = getattr(row, "point_id", None)
         if pd.isna(point_id):
             continue
         pid = str(int(point_id)) if str(point_id).replace(".0", "").isdigit() else str(point_id)
-        # On retente automatiquement les points précédemment en admin_empty_debug_saved ou error.
-        if force_refresh or pid not in valid_cache:
+        if force_refresh or pid not in existing:
             rows_to_fetch.append(row)
 
     progress = st.progress(0, text=f"Récupération horaires : 0/{len(rows_to_fetch)}") if rows_to_fetch else None
@@ -690,7 +877,6 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
         point_id = getattr(row, "point_id", None)
         code = getattr(row, "code", "")
         point_type = getattr(row, "type", "")
-
         pid = str(int(point_id)) if str(point_id).replace(".0", "").isdigit() else str(point_id)
 
         if point_type == "Casier / Locker":
@@ -724,7 +910,6 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
         cache.to_csv(cache_path, index=False, encoding="utf-8-sig")
         cache.to_excel(DATA_DIR / f"working_hours_cache_{center_code}.xlsx", index=False)
 
-    # Merge robuste
     for col in ["hours_json", "has_lunch_break", "hours_source", "horaires_ouverture", "pause_midi_detectee"]:
         if col in df.columns:
             df = df.drop(columns=[col])
@@ -738,10 +923,10 @@ def enrich_points_with_hours(df, center_code, admin_cookie, force_refresh=False)
     df["hours_source"] = df["hours_source"].fillna("missing")
     df = add_hours_display_columns(df)
 
-    ok_count = int((df["hours_source"] == "admin_ok").sum())
+    ok_count = int(df["hours_source"].isin(["admin_ok", "excel_ok"]).sum())
     empty_count = int((df["hours_source"] == "admin_empty_debug_saved").sum())
     error_count = int(df["hours_source"].astype(str).str.startswith("error:").sum())
-    st.caption(f"Horaires : {ok_count} OK, {empty_count} vides/debug, {error_count} erreurs, sur {len(df)} points. Si beaucoup de vides, le debug est dans data/debug_hours.")
+    st.caption(f"Horaires : {ok_count} OK, {empty_count} vides/debug, {error_count} erreurs, sur {len(df)} points.")
     return df
 
 
@@ -1376,6 +1561,25 @@ with st.sidebar:
 
     auto_nb_tournees = st.checkbox("Utiliser le nombre de tournées conseillé automatiquement", value=True)
     target_route_min = st.number_input("Durée cible max par tournée (min)", min_value=300, max_value=600, value=420, step=15)
+
+    st.subheader("Temps de service")
+    service_locker_min = st.number_input(
+        "Temps par locker / casier (min)",
+        min_value=0,
+        max_value=60,
+        value=15,
+        step=1,
+        help="Temps ajouté à chaque locker dans le calcul de tournée."
+    )
+    service_relais_min = st.number_input(
+        "Temps par point relais (min)",
+        min_value=0,
+        max_value=60,
+        value=5,
+        step=1,
+        help="Temps ajouté à chaque point relais dans le calcul de tournée."
+    )
+
     max_auto_routes = st.number_input("Maximum de tournées autorisées", min_value=5, max_value=60, value=40, step=1)
 
     nb_tournees = st.number_input(
@@ -1395,7 +1599,6 @@ with st.sidebar:
     heure_depart_obj = st.time_input("Heure de départ", value=time(8, 0))
     heure_depart = heure_depart_obj.strftime("%H:%M")
     force_hours_refresh = st.checkbox("Forcer la mise à jour des horaires", value=False)
-    clear_hours_cache = st.checkbox("Vider le cache horaires avant récupération", value=False)
 
     manual_batch = st.text_input("Batch ID manuel (optionnel)", value="")
 
@@ -1456,23 +1659,19 @@ if hours_btn:
     try:
         if st.session_state.df is None or st.session_state.df.empty:
             raise RuntimeError("Récupère d’abord les points VintedGo.")
-        if not ADMIN_COOKIE:
+        has_excel_hours = (
+            (selected_center == "LIL3" and (DATA_DIR / "horaires_complet.xlsx").exists())
+            or (selected_center == "AIX3" and (DATA_DIR / "horaires_points_AIX3_11062026.xlsx").exists())
+        )
+        if not ADMIN_COOKIE and not has_excel_hours:
             raise RuntimeError("VINTED_ADMIN_COOKIE manquant dans les secrets Streamlit.")
 
         with st.spinner("Récupération de tous les horaires du batch..."):
-            if clear_hours_cache:
-                cache_file = DATA_DIR / f"working_hours_cache_{selected_center}.csv"
-                cache_xlsx = DATA_DIR / f"working_hours_cache_{selected_center}.xlsx"
-                if cache_file.exists():
-                    cache_file.unlink()
-                if cache_xlsx.exists():
-                    cache_xlsx.unlink()
-
             st.session_state.df = enrich_points_with_hours(
                 st.session_state.df,
                 selected_center,
                 ADMIN_COOKIE,
-                force_refresh=force_hours_refresh or clear_hours_cache,
+                force_refresh=force_hours_refresh,
             )
             st.session_state.opt = None
             st.session_state.summary = None
@@ -1485,6 +1684,9 @@ if st.session_state.batches_df is not None:
     st.dataframe(st.session_state.batches_df, use_container_width=True, height=180)
 
 df = st.session_state.df
+if df is not None and not df.empty:
+    df = apply_service_times(df, service_locker_min, service_relais_min)
+    st.session_state.df = df
 
 if df is not None and not df.empty:
     st.subheader(f"Points récupérés — {selected_center}")
@@ -1495,51 +1697,22 @@ if df is not None and not df.empty:
     d.metric("Batch", str(df["batch_id"].iloc[0]) if "batch_id" in df else "-")
 
     display_df = df.copy()
-    if "point_id" in display_df.columns:
-        display_df["working_hours_url"] = display_df["point_id"].apply(
-            lambda x: f"https://admin.vintedgo.com/fr/points/{int(x)}?tab=working_hours" if pd.notna(x) else ""
-        )
     if "hours_json" in display_df.columns and "horaires_ouverture" not in display_df.columns:
         display_df = add_hours_display_columns(display_df)
     preferred_cols = [
-        "point_id", "code", "type", "nom", "adresse", "ville", "code_postal",
-        "horaires_ouverture", "pause_midi_detectee", "hours_source",
-        "working_hours_url", "lat", "lon", "maps"
+        "admin_point_id", "code", "type", "service", "nom", "adresse", "ville", "code_postal",
+        "horaires_ouverture", "pause_midi_detectee", "hours_source", "match_method",
+        "lat", "lon", "maps"
     ]
     cols = [c for c in preferred_cols if c in display_df.columns] + [c for c in display_df.columns if c not in preferred_cols]
     st.dataframe(display_df[cols], use_container_width=True, height=260)
-
-    if "point_id" in display_df.columns:
-        with st.expander("Diagnostic horaires d'un point", expanded=False):
-            sample_ids = display_df.loc[display_df.get("type", "") == "Point relais", "point_id"].dropna().astype(int).astype(str).tolist()
-            default_pid = sample_ids[0] if sample_ids else str(int(display_df["point_id"].dropna().iloc[0]))
-            diag_pid = st.text_input("Point ID à tester", value=default_pid)
-            if st.button("Tester ce point"):
-                try:
-                    status, url, raw_text = fetch_working_hours_response(diag_pid, ADMIN_COOKIE)
-                    intervals = parse_hours_from_rsc_text(raw_text)
-                    stripped = strip_html_for_hours(raw_text or "")
-                    st.write({
-                        "status": status,
-                        "url": url,
-                        "intervals_found": intervals[:10],
-                        "raw_length": len(raw_text or ""),
-                        "contains_heures": "Heures" in (raw_text or "") or "heures" in (raw_text or "").lower(),
-                        "contains_opens_at": "opens_at" in (raw_text or "") or "opensAt" in (raw_text or ""),
-                    })
-                    st.caption("Texte HTML nettoyé — extrait")
-                    st.code(stripped[:2500])
-                    st.caption("Réponse brute — extrait")
-                    st.code((raw_text or "")[:2500])
-                except Exception as e:
-                    st.error(str(e))
     if "hours_source" in display_df.columns:
         st.caption("Diagnostic horaires")
         st.write(display_df["hours_source"].value_counts())
 
     if opt_btn:
         try:
-            df_for_opt = df.copy()
+            df_for_opt = apply_service_times(df.copy(), service_locker_min, service_relais_min)
 
             with st.spinner("Détection rapide du nombre de tournées..." if auto_nb_tournees else "Préparation optimisation..."):
                 if auto_nb_tournees:
@@ -1566,6 +1739,11 @@ if df is not None and not df.empty:
                     mode_used = mode_optimisation
             else:
                 mode_used = "Distance uniquement"
+
+            st.caption(
+                f"Mode : {mode_used} | Service locker : {service_locker_min} min | "
+                f"Service relais : {service_relais_min} min"
+            )
 
             with st.spinner(f"Optimisation équilibrée — {mode_used}..."):
                 opt, summary = optimise_balanced(
