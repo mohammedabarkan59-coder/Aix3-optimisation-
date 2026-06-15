@@ -702,9 +702,18 @@ def load_center_hours_excel(center_code):
             cp,
             normalize_match_value(ville),
         ])
+        code_key = normalize_match_value(row.get("code", ""))
+
+        raw_id = r.get("ID", "")
+        if pd.isna(raw_id):
+            admin_point_id = ""
+        else:
+            admin_point_id = str(raw_id).strip()
+            if admin_point_id.endswith(".0"):
+                admin_point_id = admin_point_id[:-2]
 
         rows.append({
-            "admin_point_id": str(int(float(r.get("ID")))) if pd.notna(r.get("ID")) else "",
+            "admin_point_id": admin_point_id,
             "excel_type": typ,
             "excel_nom": nom,
             "excel_adresse": adresse,
@@ -715,6 +724,7 @@ def load_center_hours_excel(center_code):
             "full_key": full_key,
             "address_key": address_key,
             "name_city_key": name_city_key,
+            "code_key": normalize_match_value(admin_point_id),
         })
 
     return pd.DataFrame(rows)
@@ -738,61 +748,68 @@ def enrich_points_with_center_excel(df, center_code):
     by_full = {r["full_key"]: r for _, r in hours.iterrows() if r.get("full_key")}
     by_addr = {r["address_key"]: r for _, r in hours.iterrows() if r.get("address_key")}
     by_name_city = {r["name_city_key"]: r for _, r in hours.iterrows() if r.get("name_city_key")}
+    by_code = {r["code_key"]: r for _, r in hours.iterrows() if r.get("code_key")}
 
     new_rows = []
     matched = 0
 
     for _, row in df.iterrows():
         point_type = row.get("type", "")
-        if point_type == "Casier / Locker":
+
+        # On tente toujours le matching Excel d'abord, même pour les lockers/casiers.
+        # Certains lockers ont de vrais horaires d'accès dans l'Excel, par exemple Elephant Bleu.
+        nom = row.get("nom", "")
+        adresse = row.get("adresse", "")
+        cp = clean_postal_code(row.get("code_postal", ""))
+        ville = row.get("ville", "")
+
+        full_key = "||".join([
+            normalize_match_value(nom),
+            normalize_match_value(adresse),
+            cp,
+            normalize_match_value(ville),
+        ])
+        address_key = "||".join([
+            normalize_match_value(adresse),
+            cp,
+            normalize_match_value(ville),
+        ])
+        name_city_key = "||".join([
+            normalize_match_value(nom),
+            cp,
+            normalize_match_value(ville),
+        ])
+        code_key = normalize_match_value(row.get("code", ""))
+
+        match = None
+        match_method = ""
+        if full_key in by_full:
+            match = by_full[full_key]
+            match_method = "full"
+        elif address_key in by_addr:
+            match = by_addr[address_key]
+            match_method = "address"
+        elif name_city_key in by_name_city:
+            match = by_name_city[name_city_key]
+            match_method = "name_city"
+        elif code_key in by_code:
+            match = by_code[code_key]
+            match_method = "code"
+
+        if match is not None:
+            intervals = json.loads(match["hours_json"]) if isinstance(match["hours_json"], str) else match["hours_json"]
+            source = "excel_ok" if intervals else "excel_empty"
+            admin_point_id = match.get("admin_point_id", "")
+            matched += 1 if intervals else 0
+        elif point_type == "Casier / Locker":
             intervals = [{"day": "unknown", "opens_at": "00:00", "closes_at": "23:59"}]
             source = "locker_default"
             admin_point_id = ""
-            match_method = "locker"
+            match_method = "locker_default"
         else:
-            nom = row.get("nom", "")
-            adresse = row.get("adresse", "")
-            cp = clean_postal_code(row.get("code_postal", ""))
-            ville = row.get("ville", "")
-
-            full_key = "||".join([
-                normalize_match_value(nom),
-                normalize_match_value(adresse),
-                cp,
-                normalize_match_value(ville),
-            ])
-            address_key = "||".join([
-                normalize_match_value(adresse),
-                cp,
-                normalize_match_value(ville),
-            ])
-            name_city_key = "||".join([
-                normalize_match_value(nom),
-                cp,
-                normalize_match_value(ville),
-            ])
-
-            match = None
-            match_method = ""
-            if full_key in by_full:
-                match = by_full[full_key]
-                match_method = "full"
-            elif address_key in by_addr:
-                match = by_addr[address_key]
-                match_method = "address"
-            elif name_city_key in by_name_city:
-                match = by_name_city[name_city_key]
-                match_method = "name_city"
-
-            if match is not None:
-                intervals = json.loads(match["hours_json"]) if isinstance(match["hours_json"], str) else match["hours_json"]
-                source = "excel_ok" if intervals else "excel_empty"
-                admin_point_id = match.get("admin_point_id", "")
-                matched += 1 if intervals else 0
-            else:
-                intervals = []
-                source = "excel_not_matched"
-                admin_point_id = ""
+            intervals = []
+            source = "excel_not_matched"
+            admin_point_id = ""
 
         pid = row.get("point_id", "")
         pid = str(int(float(pid))) if str(pid).replace(".0", "").isdigit() else str(pid)
@@ -1521,7 +1538,7 @@ if not allowed_centers:
 with st.sidebar:
     st.success(f"Connecté : {st.session_state.username}")
 
-    if st.session_state.username == "mohammed":
+    if st.session_state.username in ["mohammed", "kevin"]:
         with st.expander("🔐 Admin — Token VintedGo", expanded=False):
             token_status = "token app actif" if read_runtime_token() else "token des Secrets"
             st.caption(f"Source actuelle : {token_status}")
@@ -1534,7 +1551,7 @@ with st.sidebar:
             if st.button("Sauvegarder le token pour tous les comptes"):
                 try:
                     saved = write_runtime_token(new_token, st.session_state.username)
-                    st.success("Token mis à jour pour mohammed, kevin et lil3.")
+                    st.success("Token mis à jour pour tous les comptes.")
                     st.session_state.df = None
                     st.session_state.opt = None
                     st.session_state.summary = None
