@@ -702,8 +702,6 @@ def load_center_hours_excel(center_code):
             cp,
             normalize_match_value(ville),
         ])
-        code_key = normalize_match_value(row.get("code", ""))
-
         raw_id = r.get("ID", "")
         if pd.isna(raw_id):
             admin_point_id = ""
@@ -812,7 +810,9 @@ def enrich_points_with_center_excel(df, center_code):
             admin_point_id = ""
 
         pid = row.get("point_id", "")
-        pid = str(int(float(pid))) if str(pid).replace(".0", "").isdigit() else str(pid)
+        pid = str(pid).strip()
+        if pid.endswith(".0") and pid.replace(".0", "").isdigit():
+            pid = pid[:-2]
 
         new_rows.append({
             "point_id": pid,
